@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>PBR Material Tester</title>
+    <style>
+        body { margin: 0; background: #000; color: #fff; font-family: monospace; display: flex; overflow: hidden; }
+        #ui { width: 280px; padding: 20px; border-right: 1px solid #333; height: 100vh; box-sizing: border-box; overflow-y: auto; z-index: 10; }
+        input, select { display: block; margin-bottom: 8px; width: 100%; background: #222; color: #fff; border: 1px solid #444; padding: 5px; box-sizing: border-box; }
+        label { display: block; font-size: 11px; color: #888; text-transform: uppercase; margin-top: 10px; }
+        .texture-unit { margin-bottom: 15px; border-bottom: 1px solid #222; padding-bottom: 10px; }
+        .unload-btn { width: 100%; background: #422; color: #f88; border: 1px solid #633; cursor: pointer; font-size: 10px; padding: 4px; text-transform: uppercase; }
+        .unload-btn:hover { background: #622; }
+        canvas { flex-grow: 1; cursor: grab; }
+        .info { font-size: 10px; color: #666; margin-top: 10px; line-height: 1.4; }
+        hr { border: 0; border-top: 1px solid #333; margin: 20px 0; }
+    </style>
+</head>
+<body>
+
+<div id="ui">
+    <label>Geometry</label>
+    <select id="geomType">
+        <option value="sphere">Sphere</option>
+        <option value="cube">Cube</option>
+    </select>
+
+    <label>Sun Intensity</label>
+    <input type="range" id="sunVal" min="0" max="10" step="0.1" value="2">
+
+    <label>Ambient Intensity</label>
+    <input type="range" id="ambVal" min="0" max="2" step="0.01" value="0.5">
+
+    <label>Normalmap Strength</label>
+    <input type="range" id="normVal" min="0" max="1" step="0.01" value="0.5">
+    
+    <label>Environment Map</label>
+    <select id="envType">
+        <option value="none" selected>None</option>
+        <option value="built-in">Built-in (Room)</option>
+    </select>
+    
+    <hr>
+    
+    <div class="texture-unit">
+        <label>Albedo (sRGB)</label>
+        <input type="file" id="map">
+        <button class="unload-btn" data-prop="map">Unload</button>
+    </div>
+
+    <div class="texture-unit">
+        <label>Normal (Linear)</label>
+        <input type="file" id="normalMap">
+        <button class="unload-btn" data-prop="normalMap">Unload</button>
+    </div>
+
+    <div class="texture-unit">
+        <label>Roughness (Linear)</label>
+        <input type="file" id="roughnessMap">
+        <button class="unload-btn" data-prop="roughnessMap">Unload</button>
+    </div>
+
+    <div class="texture-unit">
+        <label>Metalness (Linear)</label>
+        <input type="file" id="metalnessMap">
+        <button class="unload-btn" data-prop="metalnessMap">Unload</button>
+    </div>
+
+    <div class="texture-unit">
+        <label>AO (Linear)</label>
+        <input type="file" id="aoMap">
+        <button class="unload-btn" data-prop="aoMap">Unload</button>
+    </div>
+
+    <div class="info">
+        <b>Left Click Drag:</b> Rotate View<br>
+        <b>Space + Left Drag:</b> Rotate Sun<br>
+        <b>Right Click Drag:</b> Pan<br>
+        <b>Scroll:</b> Zoom<br>
+    </div>
+</div>
+
+<script type="importmap">
+    { 
+        "imports": { 
+            "three": "https://unpkg.com/three@0.183.2/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.183.2/examples/jsm/"
+        } 
+    }
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, (window.innerWidth - 280) / window.innerHeight, 0.1, 100);
+    camera.position.set(2.5, 0.5, -1.0);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth - 280, window.innerHeight);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    document.body.appendChild(renderer.domElement);
+
+    const maxAnisotropy = renderer.capabilities.getMaxAnisotropy();
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+
+    const loader = new THREE.TextureLoader();
+    const pano_data = "data:image/png;base64,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";
+    
+    const roomEnv = loader.load(pano_data);
+    roomEnv.mapping = THREE.EquirectangularReflectionMapping;
+    roomEnv.colorSpace = THREE.SRGBColorSpace;
+    scene.background = roomEnv;
+    scene.environment = roomEnv;
+    
+    const sun = new THREE.DirectionalLight(0xffffff, 2);
+    sun.position.set(5, 5, 5);
+    sun.castShadow = true; 
+    scene.add(sun);
+
+    const ambient = new THREE.HemisphereLight( 0xffffff, 0x505050, 0.5);
+    scene.add(ambient);
+    
+    const gridHelper = new THREE.GridHelper(200, 50, 0x444444, 0x222222);
+    gridHelper.position.y = -0.8; // Align with the bottom of the sphere
+    scene.add(gridHelper);
+    
+        // Create a procedural sun texture
+        const canvas = document.createElement('canvas');
+        canvas.width = 128; canvas.height = 128;
+        const ctx = canvas.getContext('2d');
+        const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+        grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+        grad.addColorStop(0.2, 'rgba(255, 255, 220, 0.6)');
+        grad.addColorStop(0.5, 'rgba(255, 200, 100, 0.1)');
+        grad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 128, 128);
+
+        const sunSprite = new THREE.Sprite(new THREE.SpriteMaterial({ 
+            map: new THREE.CanvasTexture(canvas), 
+            blending: THREE.AdditiveBlending 
+        }));
+        sunSprite.scale.set(5, 5, 1); // Make it look large in the "sky"
+        scene.add(sunSprite);
+        // Helper function to keep sprite and light in sync
+        function updateSunPosition(phi, theta) {
+            const distance = 40; // Keeps it far away like a skybox element
+            sun.position.setFromSphericalCoords(distance, phi, theta);
+            sunSprite.position.copy(sun.position);
+        }
+
+    {
+        // Initialize position
+        let sunPhi = Math.PI / 4, sunTheta = Math.PI / 4;
+        updateSunPosition(sunPhi, sunTheta);
+    }
+    
+    const sphereGeom = new THREE.SphereGeometry(0.8, 64, 64);
+    for (let i = 0; i < sphereGeom.attributes.uv.array.length; i += 2) {
+        sphereGeom.attributes.uv.array[i] *= 4.0;
+        sphereGeom.attributes.uv.array[i+1] *= 2.0;
+    }
+    const cubeGeom = new THREE.BoxGeometry(1, 1, 1);
+    
+    const material = new THREE.MeshStandardMaterial({ 
+        color: 0xffffff, 
+        metalness: 0.0, 
+        roughness: 0.5 
+    });
+    
+    material.shadowSide = THREE.DoubleSide;
+    //sun.shadow.bias = -0.0001;
+    sun.shadow.bias = -0.0003;
+    //sun.shadow.normalBias = 0.03;
+
+    const mesh = new THREE.Mesh(sphereGeom, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    
+    scene.add(mesh);
+
+    const handleFile = (id, prop) => {
+        document.getElementById(id).onchange = (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const url = URL.createObjectURL(file);
+            loader.load(url, (t) => {
+                t.flipY = true;
+                t.wrapT = THREE.RepeatWrapping;
+                t.wrapS = THREE.RepeatWrapping;
+                t.anisotropy = maxAnisotropy;
+                t.colorSpace = (prop === 'map') ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+                
+                if (material[prop]) material[prop].dispose();
+                material[prop] = t;
+
+                // Ensure multiplier is 1.0 when a map is present
+                if (prop === 'metalnessMap') material.metalness = 1.0;
+                if (prop === 'roughnessMap') material.roughness = 1.0;
+                
+                if (prop === 'aoMap') {
+                    sphereGeom.attributes.uv2 = sphereGeom.attributes.uv;
+                    cubeGeom.attributes.uv2 = cubeGeom.attributes.uv;
+                }
+                material.needsUpdate = true;
+            });
+        };
+    };
+
+    ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap'].forEach(p => handleFile(p, p));
+
+    material.normalScale.set(0.5, 0.5);
+    
+    document.querySelectorAll('.unload-btn').forEach(btn => {
+        btn.onclick = () => {
+            const prop = btn.getAttribute('data-prop');
+            if (material[prop]) {
+                material[prop].dispose();
+                material[prop] = null;
+                document.getElementById(prop).value = "";
+
+                // Revert to defaults if map is removed
+                if (prop === 'metalnessMap') material.metalness = 0.0;
+                if (prop === 'roughnessMap') material.roughness = 0.5;
+                
+                material.needsUpdate = true;
+            }
+        };
+    });
+
+    document.getElementById('geomType').onchange = (e) => {
+        mesh.geometry = (e.target.value === 'sphere') ? sphereGeom : cubeGeom;
+    };
+    document.getElementById('sunVal').oninput = (e) => sun.intensity = parseFloat(e.target.value);
+    document.getElementById('ambVal').oninput = (e) => {
+        ambient.intensity = parseFloat(e.target.value);
+        if (scene.environment == null) {
+            scene.background = new THREE.Color(ambient.intensity * 0.5, ambient.intensity * 0.5, ambient.intensity * 0.5);
+        }
+    }
+    document.getElementById('normVal').oninput = (e) => {
+        let x = parseFloat(e.target.value);
+        material.normalScale.set(x, x);
+    }
+    document.getElementById('envType').onchange = (e) => {
+        const isBuiltIn = e.target.value === 'built-in';
+        scene.environment = isBuiltIn ? roomEnv : null;
+        scene.background = isBuiltIn ? roomEnv : new THREE.Color(ambient.intensity * 0.5, ambient.intensity * 0.5, ambient.intensity * 0.5);
+    };
+
+    let isSpaceDown = false;
+    let sunPhi = Math.PI / 4, sunTheta = Math.PI / 4;
+    window.addEventListener('keydown', (e) => { if (e.code === 'Space') { isSpaceDown = true; controls.enabled = false; } });
+    window.addEventListener('keyup', (e) => { if (e.code === 'Space') { isSpaceDown = false; controls.enabled = true; } });
+
+    renderer.domElement.addEventListener('mousemove', (e) => {
+        if (isSpaceDown && e.buttons === 1) {
+            sunTheta -= e.movementX * 0.01;
+            sunPhi += e.movementY * 0.01;
+            sunPhi = Math.max(0.1, Math.min(Math.PI - 0.1, sunPhi));
+            sun.position.setFromSphericalCoords(7, sunPhi, sunTheta);
+            updateSunPosition(sunPhi, sunTheta);
+        }
+    });
+    
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+    animate();
+
+    window.onresize = () => {
+        const w = window.innerWidth - 280;
+        camera.aspect = w / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w, window.innerHeight);
+    };
+</script>
+</body>
+</html>
