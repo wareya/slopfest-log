@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebGL Cubemap to Equirectangular Converter</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; text-align: center; margin: 2rem; background-color: #f4f4f9; color: #333; }
+        h1 { color: #1a1a1a; }
+        #controls { display: flex; justify-content: center; align-items: center; gap: 1rem; flex-wrap: wrap; margin: 1.5rem 0; }
+        input, select, button { padding: 0.5rem; border-radius: 4px; border: 1px solid #ccc; }
+        button { background-color: #007bff; color: white; border-color: #007bff; cursor: pointer; font-weight: bold; }
+        button:disabled { background-color: #a0a0a0; cursor: not-allowed; border-color: #a0a0a0; }
+        a { display: inline-block; padding: 0.6rem 1.2rem; background-color: #28a745; color: white; text-decoration: none; border-radius: 4px; margin-top: 1rem; font-weight: bold; }
+        a.hidden { display: none; }
+        canvas { border: 1px solid #ccc; margin: 1rem 0; max-width: 100%; background-color: #fff; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .info { font-size: 0.9rem; color: #666; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <h1>Cubemap to Equirectangular Panorama</h1>
+    <p>Upload 6 faces. Images will be <b>center-cropped to squares</b> and rescaled to the <b>nearest Power of 2</b>.</p>
+    <p class="info">Filenames must contain: posx, negx, posy, negy, posz, negz.<br>
+    <i>Fallback: If names don't match, they are sorted (e.g., 1.jpg, 2.jpg) and assigned: negx, posx, negy, posy, posz, negz.</i></p>
+
+    <div id="controls">
+        <input type="file" id="cubemapInputs" multiple accept="image/*">
+        <label for="resolution">Output Width:</label>
+        <input type="number" id="resolution" value="4096" min="256" step="256">
+        <button id="convertBtn" disabled>Convert</button>
+    </div>
+
+    <canvas id="canvas"></canvas>
+    <br>
+    <a id="downloadLink" class="hidden">Download Equirectangular Image</a>
+
+    <script id="vertex-shader" type="x-shader/x-vertex">
+        attribute vec2 a_position;
+        varying vec2 v_texCoord;
+        void main() {
+            gl_Position = vec4(a_position, 0.0, 1.0);
+            v_texCoord = a_position * 0.5 + 0.5;
+        }
+    </script>
+
+    <script id="fragment-shader" type="x-shader/x-fragment">
+        precision highp float;
+        uniform samplerCube u_cubemap;
+        varying vec2 v_texCoord;
+
+        const float PI = 3.141592653589793;
+
+        void main() {
+            float longitude = v_texCoord.x * 2.0 * PI - PI;
+            float latitude = v_texCoord.y * PI - (PI / 2.0);
+
+            vec3 dir;
+            dir.x = cos(latitude) * cos(longitude);
+            dir.y = sin(latitude);
+            dir.z = cos(latitude) * sin(longitude);
+
+            vec3 sampleVec = vec3(dir.z, dir.y, dir.x);
+            gl_FragColor = textureCube(u_cubemap, sampleVec);
+        }
+    </script>
+
+    <script>
+        const cubemapInputs = document.getElementById('cubemapInputs');
+        const resolutionInput = document.getElementById('resolution');
+        const convertBtn = document.getElementById('convertBtn');
+        const downloadLink = document.getElementById('downloadLink');
+        const canvas = document.getElementById('canvas');
+        const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true, antialias: false });
+
+        let cubemapImages = {};
+
+        if (!gl) {
+            alert('WebGL not supported.');
+        }
+
+        const naturalSort = (a, b) => {
+            return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+        };
+
+        function closestPowerOfTwo(n) {
+            return Math.pow(2, Math.ceil(Math.log(n) / Math.log(2)));
+        }
+
+        function processImage(img) {
+            const cropSize = Math.min(img.width, img.height);
+            const potSize = closestPowerOfTwo(cropSize);
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = potSize;
+            tempCanvas.height = potSize;
+            const tempCtx = tempCanvas.getContext('2d');
+
+            const sx = (img.width - cropSize) / 2;
+            const sy = (img.height - cropSize) / 2;
+
+            tempCtx.drawImage(img, sx, sy, cropSize, cropSize, 0, 0, potSize, potSize);
+            return tempCanvas;
+        }
+
+        cubemapInputs.addEventListener('change', (e) => {
+            const files = Array.from(e.target.files);
+            if (files.length !== 6) {
+                alert('Please select exactly 6 images.');
+                return;
+            }
+
+            let loadedCount = 0;
+            const expectedNames = ['posx', 'negx', 'posy', 'negy', 'posz', 'negz'];
+            const fallbackOrder = ['negx', 'posx', 'negy', 'posy', 'posz', 'negz'];
+            cubemapImages = {}; 
+
+            let nameMatchedFiles = [];
+            files.forEach(file => {
+                const fileName = file.name.toLowerCase();
+                const face = expectedNames.find(name => fileName.includes(name));
+                if (face) nameMatchedFiles.push({ face, file });
+            });
+
+            const finalMapping = [];
+            if (nameMatchedFiles.length === 6) {
+                nameMatchedFiles.forEach(item => finalMapping.push(item));
+            } else {
+                console.log("Using semantic sort fallback.");
+                files.sort(naturalSort);
+                files.forEach((file, index) => {
+                    finalMapping.push({ face: fallbackOrder[index], file });
+                });
+            }
+
+            finalMapping.forEach(({ face, file }) => {
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    const img = new Image();
+                    img.onload = () => {
+                        cubemapImages[face] = processImage(img);
+                        loadedCount++;
+                        if (loadedCount === 6) {
+                            convertBtn.disabled = false;
+                        }
+                    };
+                    img.src = event.target.result;
+                };
+                reader.readAsDataURL(file);
+            });
+        });
+
+        convertBtn.addEventListener('click', () => {
+            if (Object.keys(cubemapImages).length === 6 && gl) {
+                const cubemapSheet = createCubemapSheet();
+                render(cubemapSheet);
+            }
+        });
+
+        function createCubemapSheet() {
+            const faceSize = cubemapImages.posx.width;
+            const sheetCanvas = document.createElement('canvas');
+            sheetCanvas.width = faceSize * 4;
+            sheetCanvas.height = faceSize * 3;
+            const ctx = sheetCanvas.getContext('2d');
+
+            ctx.drawImage(cubemapImages.posy, faceSize, 0); 
+            ctx.drawImage(cubemapImages.negx, 0, faceSize); 
+            ctx.drawImage(cubemapImages.posz, faceSize, faceSize); 
+            ctx.drawImage(cubemapImages.posx, faceSize * 2, faceSize); 
+            ctx.drawImage(cubemapImages.negz, faceSize * 3, faceSize); 
+            ctx.drawImage(cubemapImages.negy, faceSize, faceSize * 2); 
+            
+            return sheetCanvas;
+        }
+
+        function render(sourceImage) {
+            const outputWidth = parseInt(resolutionInput.value, 10);
+            if (isNaN(outputWidth) || outputWidth <= 0) {
+                alert("Invalid width.");
+                return;
+            }
+            canvas.width = outputWidth;
+            canvas.height = outputWidth / 2;
+            gl.viewport(0, 0, canvas.width, canvas.height);
+
+            const vsSource = document.getElementById('vertex-shader').text;
+            const fsSource = document.getElementById('fragment-shader').text;
+            
+            const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
+            const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+            const program = createProgram(gl, vs, fs);
+            gl.useProgram(program);
+
+            const cubemapTexture = createCubemapFrom4x3(gl, sourceImage);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, cubemapTexture);
+            gl.uniform1i(gl.getUniformLocation(program, "u_cubemap"), 0);
+
+            const positionLocation = gl.getAttribLocation(program, "a_position");
+            const positionBuffer = gl.createBuffer();
+            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+                -1, -1,  1, -1, -1,  1,
+                -1,  1,  1, -1,  1,  1,
+            ]), gl.STATIC_DRAW);
+            gl.enableVertexAttribArray(positionLocation);
+            gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+            gl.clearColor(0, 0, 0, 1);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+            downloadLink.href = canvas.toDataURL('image/png');
+            downloadLink.download = 'equirectangular.png';
+            downloadLink.classList.remove('hidden');
+        }
+
+        function createCubemapFrom4x3(gl, image) {
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_CUBE_MAP, texture);
+
+            const faceSize = image.width / 4;
+            const faces = [
+                { target: gl.TEXTURE_CUBE_MAP_POSITIVE_X, x: 2, y: 1 }, 
+                { target: gl.TEXTURE_CUBE_MAP_NEGATIVE_X, x: 0, y: 1 }, 
+                { target: gl.TEXTURE_CUBE_MAP_POSITIVE_Y, x: 1, y: 0 }, 
+                { target: gl.TEXTURE_CUBE_MAP_NEGATIVE_Y, x: 1, y: 2 }, 
+                { target: gl.TEXTURE_CUBE_MAP_POSITIVE_Z, x: 1, y: 1 }, 
+                { target: gl.TEXTURE_CUBE_MAP_NEGATIVE_Z, x: 3, y: 1 }, 
+            ];
+            
+            const faceCanvas = document.createElement('canvas');
+            faceCanvas.width = faceSize;
+            faceCanvas.height = faceSize;
+            const faceCtx = faceCanvas.getContext('2d');
+
+            for (const face of faces) {
+                faceCtx.drawImage(image, face.x * faceSize, face.y * faceSize, faceSize, faceSize, 0, 0, faceSize, faceSize);
+                gl.texImage2D(face.target, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, faceCanvas);
+            }
+
+            gl.generateMipmap(gl.TEXTURE_CUBE_MAP);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+            return texture;
+        }
+
+        function createShader(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+                console.error(gl.getShaderInfoLog(shader));
+                gl.deleteShader(shader);
+                return null;
+            }
+            return shader;
+        }
+
+        function createProgram(gl, vs, fs) {
+            const program = gl.createProgram();
+            gl.attachShader(program, vs);
+            gl.attachShader(program, fs);
+            gl.linkProgram(program);
+            if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+                console.error(gl.getProgramInfoLog(program));
+                return null;
+            }
+            return program;
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GLTF Zip to GLB Converter</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; background-color: #f4f4f9; }
+        .container { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 400px; }
+        input[type="file"] { margin: 1rem 0; }
+        #status { margin-top: 1rem; font-size: 0.9rem; color: #555; }
+        button { background-color: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-weight: 600; }
+        button:disabled { background-color: #ccc; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>GLTF Packager</h2>
+    <p>Upload a .zip containing your .gltf and textures.</p>
+    <input type="file" id="fileInput" accept=".zip">
+    <br>
+    <button id="convertBtn" disabled>Convert to GLB</button>
+    <div id="status">Ready</div>
+</div>
+
+<script type="module">
+    // Using the modern glTF-Transform Core
+    import { WebIO } from 'https://cdn.skypack.dev/@gltf-transform/core';
+
+    const fileInput = document.getElementById('fileInput');
+    const convertBtn = document.getElementById('convertBtn');
+    const status = document.getElementById('status');
+
+    let zipFile = null;
+
+    fileInput.addEventListener('change', (e) => {
+        zipFile = e.target.files[0];
+        convertBtn.disabled = !zipFile;
+    });
+
+    convertBtn.addEventListener('click', async () => {
+        status.innerText = "Unzipping assets...";
+        convertBtn.disabled = true;
+
+        try {
+            const zip = await JSZip.loadAsync(zipFile);
+            
+            // 1. Find the .gltf file
+            const gltfFileName = Object.keys(zip.files).find(name => name.endsWith('.gltf'));
+            if (!gltfFileName) throw new Error("No .gltf file found in the zip.");
+
+            // 2. Extract all files into a resource map (Uint8Array)
+            const resources = {};
+            const pendingFiles = [];
+
+            zip.forEach((path, file) => {
+                if (!file.dir) {
+                    const task = file.async('uint8array').then(data => {
+                        // Store using the filename/path as the key
+                        resources[path] = data;
+                    });
+                    pendingFiles.push(task);
+                }
+            });
+
+            await Promise.all(pendingFiles);
+
+            // 3. Initialize glTF-Transform
+            const io = new WebIO();
+
+            // 4. Parse the GLTF using the resource map
+            // We pass the JSON and the resources object directly
+            const gltfJSON = JSON.parse(new TextDecoder().decode(resources[gltfFileName]));
+            
+            // The second argument to readJSON is the resource map glTF-Transform uses 
+            // to resolve URIs for textures and .bin files.
+            const doc = await io.readJSON({
+                json: gltfJSON,
+                resources: resources
+            });
+
+            status.innerText = "Bundling to Binary...";
+
+            // 5. Export as GLB
+            const glbBuffer = await io.writeBinary(doc);
+
+            // 6. Download
+            const blob = new Blob([glbBuffer], { type: 'model/gltf-binary' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = gltfFileName.replace('.gltf', '.glb');
+            a.click();
+            URL.revokeObjectURL(url);
+
+            status.innerText = "Success!";
+        } catch (err) {
+            console.error(err);
+            status.innerText = "Error: " + err.message;
+        } finally {
+            convertBtn.disabled = false;
+        }
+    });
+</script>
+
+</body>
+</html>

@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Canvas Curve Editor</title>
+    <style>
+        canvas {
+            border: 1px solid black;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="curveCanvas" width="256" height="256"></canvas>
+    <script>
+        const canvas = document.getElementById("curveCanvas");
+        const ctx = canvas.getContext("2d");
+        let nodes = [
+            { x: 0, y: 0 },
+            
+            //{ x: 8, y: 64 },
+            
+            { x: 32, y: 192+32 },
+            { x: 64, y: 192+32 },
+            
+            { x: 256, y: 256 }
+        ];
+        let draggingNode = null;
+        const dragRadius = 10;
+
+        // Mechanically adapted from Wikipedia: Spline_interpolation#Algorithm_to_find_the_interpolating_cubic_spline
+        
+        function computeSplineTangents(points) { // points: Vec<[f32; 2]>
+            const n = points.length;
+            if (n < 2) return new Array(n).fill(0);
+
+            const x = points.map(p => p.x);
+            const y = points.map(p => p.y);
+            
+            // Allocate arrays for computations
+            const h = new Array(n - 1).fill(0);
+            const k = new Array(n).fill(0);
+            
+            // Compute step sizes
+            for (let i = 0; i < n - 1; i++) {
+                h[i] = x[i+1] - x[i];
+            }
+
+            // Tridiagonal matrix system
+            const alpha = new Array(n - 1).fill(0);
+            for (let i = 1; i < n - 1; i++) {
+                alpha[i] = 3 * ((y[i+1] - y[i]) / h[i] - (y[i] - y[i-1]) / h[i-1]);
+            }
+
+            const l = new Array(n).fill(0);
+            const mu = new Array(n - 1).fill(0);
+            const z = new Array(n).fill(0);
+
+            // Natural spline boundary conditions
+            l[0] = 1;
+            mu[0] = 0;
+            z[0] = 0;
+
+            // Forward elimination
+            for (let i = 1; i < n - 1; i++) {
+                l[i] = 2 * (x[i+1] - x[i-1]) - h[i-1] * mu[i-1];
+                mu[i] = h[i] / l[i];
+                z[i] = (alpha[i] - h[i-1] * z[i-1]) / l[i];
+            }
+
+            // Back substitution
+            l[n-1] = 1;
+            z[n-1] = 0;
+
+            for (let j = n - 2; j >= 0; j--) {
+                k[j] = z[j] - mu[j] * k[j+1];
+            }
+
+            // Endpoint tangents
+            k[n-1] = z[n-1];
+
+            return k;
+        }
+        
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.beginPath();
+            
+            let n = 4;
+            for (let i = 1; i < n; i++)
+            {
+                ctx.moveTo(0, canvas.height*i/n);
+                ctx.lineTo(canvas.width, canvas.height*i/n);
+                ctx.moveTo(canvas.width*i/n, 0);
+                ctx.lineTo(canvas.width*i/n, canvas.height);
+            }
+            
+            ctx.moveTo(canvas.width, 0);
+            ctx.lineTo(0, canvas.height);
+            
+            ctx.setLineDash([2, 2]);
+            ctx.strokeStyle = 'grey';
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.strokeStyle = 'black';
+            
+            let sortedNodes = [...nodes].sort((a, b) => a.x - b.x);
+            let tangents = computeSplineTangents(sortedNodes);
+            console.log(tangents);
+            
+            ctx.beginPath();
+            ctx.moveTo(sortedNodes[0].x, 256-sortedNodes[0].y);
+            let i = 0;
+            let y = sortedNodes[0].y;
+            for (let x = 1; x <= 256; x += 1)
+            {
+                while (i + 2 < sortedNodes.length && x > sortedNodes[i+1].x)
+                    i += 1;
+                //let next_y = sortedNodes[i].y;
+                let w = sortedNodes[i+1].x - sortedNodes[i].x;
+                let a = (sortedNodes[i+1].x - x) / w;
+                let b = (x - sortedNodes[i  ].x) / w;
+                let r1 = a * sortedNodes[i  ].y;
+                let r2 = b * sortedNodes[i+1].y;
+                let r3 = (a*a*a - a) * tangents[i];
+                let r4 = (b*b*b - b) * tangents[i+1];
+                let next_y = r1 + r2 + (r3+r4)*(w*w)/6.0;
+                
+                function interpolateSpline(x, sortedNodes, tangents, i) {
+                    const x0 = sortedNodes[i].x;
+                    const y0 = sortedNodes[i].y;
+                    const x1 = sortedNodes[i + 1].x;
+                    const y1 = sortedNodes[i + 1].y;
+                    let t0 = tangents[i];
+                    let t1 = tangents[i + 1];
+                    
+                    let h = x1-x0;
+                    let i0 = (x - x0) / h;
+                    let i1 = 1 - i0;
+                    
+                    return y0*i1 + y1*i0 +
+                        (t0*(i1+1) + t1*(i0+1)) * (-h*h*i0*i1*(1.0/3.0));
+                }
+                
+                next_y = interpolateSpline(x, sortedNodes, tangents, i);
+
+                ctx.lineTo(x, 256-next_y);
+                y = next_y;
+            }
+            ctx.stroke();
+            
+            for (const node of nodes) {
+                ctx.beginPath();
+                ctx.arc(node.x, 256-node.y, 5, 0, Math.PI * 2);
+                ctx.fillStyle = 'white';
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+        
+        canvas.addEventListener("dblclick", (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = 256-(event.clientY - rect.top);
+            const isClose = nodes.some((node, index) => 
+                index !== 0 && index !== nodes.length - 1 && 
+                Math.hypot(node.x - x, node.y - y) < 15
+            );
+
+            if (isClose) {
+                nodes = nodes.filter((node, index) => 
+                    index === 0 || index === nodes.length - 1 || 
+                    Math.hypot(node.x - x, node.y - y) >= 15
+                );
+            } else {
+                nodes.push({ x, y });
+                nodes.sort((a, b) => a.x - b.x);
+            }
+
+            draw();
+        });
+        
+        document.addEventListener("mousedown", (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const x = event.clientX - rect.left;
+            const y = 256-(event.clientY - rect.top);
+            for (const node of nodes) {
+                if (Math.hypot(node.x - x, node.y - y) < dragRadius) {
+                    draggingNode = node;
+                    break;
+                }
+            }
+        });
+
+        document.addEventListener("mousemove", (event) => {
+            if (draggingNode) {
+                const rect = canvas.getBoundingClientRect();
+                let newX = event.clientX - rect.left;
+                let newY = 256-(event.clientY - rect.top);
+                
+                draggingNode.y = Math.max(0, Math.min(256, newY));
+                if (draggingNode !== nodes[0] && draggingNode !== nodes[nodes.length - 1]) {
+                    draggingNode.x = Math.max(0, Math.min(256, newX));
+                }
+                draw();
+            }
+        });
+
+        document.addEventListener("mouseup", () => {
+            draggingNode = null;
+            nodes = [...nodes].sort((a, b) => a.x - b.x);
+        });
+
+        draw();
+    </script>
+</body>
+</html>

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DDS Texture Viewer</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a1a; color: #eee; display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        #drop-zone { border: 2px dashed #444; border-radius: 20px; width: 400px; height: 100px; display: flex; align-items: center; justify-content: center; margin-bottom: 20px; transition: background 0.3s; }
+        #drop-zone.hover { background: #333; border-color: #666; }
+        canvas { background-image: conic-gradient(#bbb 90deg, transparent 90deg 180deg, #bbb 180deg 270deg, transparent 270deg); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; border: 1px solid #000; max-width: 90vw; vertical-align: bottom; }
+        #dummy { background-color: #444; }
+        .info { margin-bottom: 10px; color: #aaa; }
+    </style>
+</head>
+<body>
+
+    <h2>DDS Viewer (DXT1/3/5)</h2>
+    <div id="drop-zone">Drop .dds file here</div>
+    <div class="info" id="file-info">Ready.</div>
+    <div id="dummy"><canvas id="preview"></canvas></div>
+
+<script>
+    const dropZone = document.getElementById('drop-zone');
+    const info = document.getElementById('file-info');
+    const canvas = document.getElementById('preview');
+    const ctx = canvas.getContext('2d');
+
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('hover'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('hover'));
+    dropZone.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('hover');
+        const file = e.dataTransfer.files[0];
+        if (file) processDDS(file);
+    });
+
+    async function processDDS(file) {
+        const buffer = await file.arrayBuffer();
+        const header = new Int32Array(buffer, 0, 32);
+        
+        if (header[0] !== 0x20534444) return alert("Not a DDS file");
+
+        const height = header[3];
+        const width = header[4];
+        const fourCC = header[21];
+        
+        let format = "";
+        if (fourCC === 0x31545844) format = "DXT1";
+        else if (fourCC === 0x33545844) format = "DXT3";
+        else if (fourCC === 0x35545844) format = "DXT5";
+        else return alert("Unsupported format. Only DXT1, 3, and 5 are supported.");
+
+        info.innerText = `File: ${file.name} | Resolution: ${width}x${height} | Format: ${format}`;
+        
+        const dataOffset = 128; // Standard DDS header size
+        const pixelData = new Uint8Array(buffer, dataOffset);
+        
+        const rgba = decompress(pixelData, width, height, format);
+        canvas.width = width;
+        canvas.height = height;
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+    }
+
+    function decompress(src, width, height, format) {
+        const dst = new Uint8Array(width * height * 4);
+        let offset = 0;
+
+        for (let y = 0; y < height; y += 4) {
+            for (let x = 0; x < width; x += 4) {
+                let block;
+                if (format === "DXT1") {
+                    block = decodeDXT1(src.subarray(offset, offset + 8));
+                    offset += 8;
+                } else if (format === "DXT3") {
+                    block = decodeDXT3(src.subarray(offset, offset + 16));
+                    offset += 16;
+                } else {
+                    block = decodeDXT5(src.subarray(offset, offset + 16));
+                    offset += 16;
+                }
+
+                for (let i = 0; i < 16; i++) {
+                    const px = x + (i % 4), py = y + Math.floor(i / 4);
+                    if (px < width && py < height) {
+                        dst.set(block.subarray(i * 4, i * 4 + 4), (py * width + px) * 4);
+                    }
+                }
+            }
+        }
+        return dst;
+    }
+
+    function rgb565(p) {
+        return [((p >> 11) & 31) * 255 / 31, ((p >> 5) & 63) * 255 / 63, (p & 31) * 255 / 31];
+    }
+
+    function getColors(block, isDXT1) {
+        const c0 = block[0] | (block[1] << 8), c1 = block[2] | (block[3] << 8);
+        const r0 = rgb565(c0), r1 = rgb565(c1);
+        const out = [...r0, 255, ...r1, 255];
+        if (!isDXT1 || c0 > c1) {
+            out.push((2 * r0[0] + r1[0]) / 3, (2 * r0[1] + r1[1]) / 3, (2 * r0[2] + r1[2]) / 3, 255);
+            out.push((r0[0] + 2 * r1[0]) / 3, (r0[1] + 2 * r1[1]) / 3, (r0[2] + 2 * r1[2]) / 3, 255);
+        } else {
+            out.push((r0[0] + r1[0]) / 2, (r0[1] + r1[1]) / 2, (r0[2] + r1[2]) / 2, 255, 0, 0, 0, 0);
+        }
+        return out;
+    }
+
+    function decodeDXT1(b) {
+        const colors = getColors(b, true), out = new Uint8Array(64);
+        for (let i = 0; i < 16; i++) {
+            const code = (b[4 + Math.floor(i / 4)] >> ((i % 4) * 2)) & 3;
+            out.set(colors.slice(code * 4, code * 4 + 4), i * 4);
+        }
+        return out;
+    }
+
+    function decodeDXT3(b) {
+        const colors = getColors(b.subarray(8), false), out = new Uint8Array(64);
+        for (let i = 0; i < 16; i++) {
+            const alpha = (b[Math.floor(i / 2)] >> ((i % 2) * 4)) & 0x0F;
+            const code = (b[8 + 4 + Math.floor(i / 4)] >> ((i % 4) * 2)) & 3;
+            out.set([...colors.slice(code * 4, code * 4 + 3), (alpha << 4) | alpha], i * 4);
+        }
+        return out;
+    }
+
+    function decodeDXT5(b) {
+        const a0 = b[0], a1 = b[1], alphas = [a0, a1];
+        if (a0 > a1) {
+            for (let i = 1; i < 7; i++) alphas.push(((7 - i) * a0 + i * a1) / 7);
+        } else {
+            for (let i = 1; i < 5; i++) alphas.push(((5 - i) * a0 + i * a1) / 5);
+            alphas.push(0, 255);
+        }
+        
+        const colors = getColors(b.subarray(8), false), out = new Uint8Array(64);
+        const aBits = (BigInt(b[2]) | BigInt(b[3]) << 8n | BigInt(b[4]) << 16n | BigInt(b[5]) << 24n | BigInt(b[6]) << 32n | BigInt(b[7]) << 40n);
+        
+        for (let i = 0; i < 16; i++) {
+            const aCode = Number((aBits >> BigInt(i * 3)) & 7n);
+            const cCode = (b[8 + 4 + Math.floor(i / 4)] >> ((i % 4) * 2)) & 3;
+            out.set([...colors.slice(cCode * 4, cCode * 4 + 3), alphas[aCode]], i * 4);
+        }
+        return out;
+    }
+</script>
+</body>
+</html>

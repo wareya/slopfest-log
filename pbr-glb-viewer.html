@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Fixed World-Space PBR</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        #drop-zone {
+            position: absolute; width: 100%; height: 100%;
+            display: flex; justify-content: center;
+            color: #444; font-family: monospace; border: 2px dashed #222;
+            z-index: 10; pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+    <div id="drop-zone">DRAG .GLB HERE</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/examples/jsm/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+        import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+        import { computeMikkTSpaceTangents } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+        //import { MikkTSpace } from 'three/examples/jsm/libs/mikktspace.module.js';
+        import * as mikktspace from "https://unpkg.com/three@0.160.0/examples/jsm/libs/mikktspace.module.js";
+        await mikktspace.ready;
+
+        const vertexShader = `
+            #include <common>
+            #include <color_pars_vertex>
+
+            attribute vec4 tangent;
+
+            varying vec3 vNormal;
+            varying vec3 vViewPosition;
+            varying vec2 vUv;
+            varying mat3 vTBN;
+
+            void main() {
+                #include <color_vertex>
+                vUv = uv;
+
+                // normalMatrix is inverse-transpose of modelViewMatrix — correct
+                // for non-uniform scale and already in view space, matching the
+                // view-space light directions Three.js provides.
+                vec3 N = normalize(normalMatrix * normal);
+                vec3 T = normalize(normalMatrix * tangent.xyz);
+                vec3 B = normalize(cross(N, T) * tangent.w);
+                vTBN = mat3(T, B, N);
+                vNormal = N;
+
+                vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
+                vViewPosition = viewPosition.xyz;
+
+                gl_Position = projectionMatrix * viewPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            #include <common>
+            #include <color_pars_fragment>
+
+            #if NUM_DIR_LIGHTS > 0
+                struct DirectionalLight {
+                    vec3 direction;
+                    vec3 color;
+                };
+                uniform DirectionalLight directionalLights[ NUM_DIR_LIGHTS ];
+            #endif
+
+            uniform vec3 ambientLightColor;
+            uniform sampler2D map;
+            uniform bool hasMap;
+            uniform sampler2D spec;
+            uniform bool hasSpec;
+            uniform sampler2D normalMap;
+            uniform bool hasNormalMap;
+            uniform vec2 normalScale;
+
+            varying vec3 vNormal;
+            varying vec3 vViewPosition;
+            varying vec2 vUv;
+            varying mat3 vTBN;
+
+            float DistributionGGX(vec3 N, vec3 H, float roughness) {
+                float a  = roughness * roughness;
+                float a2 = a * a;
+                float NdotH = max(dot(N, H), 0.0);
+                float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+                return a2 / (PI * d * d);
+            }
+
+            float GeometrySchlickGGX(float NdotX, float k) {
+                return NdotX / (NdotX * (1.0 - k) + k);
+            }
+
+            float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
+                float k = pow(roughness + 1.0, 2.0) / 8.0;
+                return GeometrySchlickGGX(max(dot(N, V), 0.0), k)
+                     * GeometrySchlickGGX(max(dot(N, L), 0.0), k);
+            }
+
+            vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+                return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+            }
+
+            mat3 calculateTBN(vec3 N, vec3 fragPos, vec2 uv)
+            {
+                vec3 dpdx = dFdx(fragPos);
+                vec3 dpdy = dFdy(fragPos);
+
+                vec2 duvdx = dFdx(uv * 128.0); // multiply by 128 to reduce numeric instability of later calculations
+                vec2 duvdy = dFdy(uv * 128.0);
+                
+                float determinant = duvdx.x * duvdy.y - duvdx.y * duvdy.x;
+                if (determinant == 0.0) determinant = 0.00001;
+                float invDet = 1.0 / determinant;
+                
+                vec3 T = (dpdx * duvdy.y - dpdy * duvdx.y) * invDet;
+                vec3 B = (dpdy * duvdx.x - dpdx * duvdy.x) * invDet;
+                
+                float x = 1.0 / (min(length(T), length(B)) + 0.00001);
+                
+                // only scale the matrix if it is numerically stable to do so
+                if (x >= 0.00001)
+                {
+                    T *= x;
+                    B *= x;
+                }
+                
+                return mat3(T, B, normalize(N));
+            }
+            void main() {
+                vec4 texel     = hasMap ? texture2D(map, vUv) : vec4(1.0);
+                vec3 specinfo  = hasSpec ? texture2D(spec, vUv).rgb : vec3(1.0, 0.5, 0.0);
+                
+                float ao = specinfo.r;
+                float rough = specinfo.g;
+                float metal = specinfo.b;
+                
+                vec3 baseColor = texel.rgb;
+                #ifdef USE_COLOR
+                    baseColor *= vColor.rgb;
+                #endif
+            
+                vec3 N = normalize(vNormal);
+            
+                //mat3 TBN = calculateTBN(N, vViewPosition, vUv);
+                mat3 TBN = vTBN;
+                
+                // All vectors in view space — N, L, and V are consistent with each other
+                // and all rotate with the camera, so dot products are stable on orbit.
+                vec3 mapN = vec3(0.0, 1.0, 0.0);
+                if (hasNormalMap) {
+                    mapN = texture2D(normalMap, vUv).xyz * 2.0 - 1.0;
+                    mapN.xy *= normalScale;
+                    N = normalize(TBN * normalize(mapN));
+                }
+                
+                if (!gl_FrontFacing) N = -N;
+                
+                // In view space the camera is at the origin, so V points from surface to origin.
+                vec3 V = normalize(-vViewPosition);
+
+                vec3 totalDiffuse  = vec3(0.0);
+                vec3 totalSpecular = vec3(0.0);
+
+                #if NUM_DIR_LIGHTS > 0
+                for (int i = 0; i < NUM_DIR_LIGHTS; i++) {
+                    // Three.js delivers directionalLights[i].direction in view space — use directly.
+                    vec3 L = normalize(directionalLights[i].direction);
+                    vec3 H = normalize(V + L);
+                    vec3 radiance = directionalLights[i].color;
+
+                    float roughness = rough;
+                    vec3  F0        = mix(vec3(0.04), baseColor, metal);
+
+                    float NDF = DistributionGGX(N, H, roughness);
+                    float G   = GeometrySmith(N, V, L, roughness);
+                    vec3  F   = fresnelSchlick(max(dot(H, V), 0.0), F0);
+
+                    float denom   = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001;
+                    vec3  specular = (NDF * G * F) / denom;
+
+                    vec3  kD    = (vec3(1.0) - F) * (1.0 - metal);
+                    float NdotL = max(dot(N, L), 0.0);
+                    totalDiffuse  += (kD * baseColor / PI) * radiance * NdotL;
+                    totalSpecular += specular * radiance * NdotL;
+                }
+                #endif
+
+                vec3 finalColor = totalDiffuse + totalSpecular + (ambientLightColor * baseColor * ao);
+                finalColor = finalColor / sqrt(finalColor*finalColor + vec3(1.0));
+                gl_FragColor = vec4(pow(finalColor, vec3(1.0 / 2.2)), texel.a);
+            }
+        `;
+
+        const scene    = new THREE.Scene();
+        const camera   = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 1000);
+        let dist = 0.2;
+        camera.position.set(2*dist,1*dist,2*dist);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(innerWidth, innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        let controls = new OrbitControls(camera, renderer.domElement);
+        controls.target.set(0, 0.5*dist, 0);
+        controls.update();
+
+        const sun = new THREE.DirectionalLight(0xffffff, 8.0);
+        sun.position.set(-7, 10, 5);
+        scene.add(sun);
+        
+        scene.add(new THREE.AmbientLight(0xffffff, 0.3));
+        
+        scene.background = new THREE.Color('skyblue'); 
+
+        let currentModel = null;
+
+        function loadModel(url) {
+            new GLTFLoader().load(url, (gltf) => {
+                if (currentModel) scene.remove(currentModel);
+                gltf.scene.traverse(child => {
+                    if (child.isMesh) {
+                        child.geometry.computeTangents();
+                        child.geometry = computeMikkTSpaceTangents(child.geometry, mikktspace, false);
+                        const oldMat = child.material;
+                        if (oldMat.map)
+                            oldMat.map.anisotropy = 16;
+                        if (oldMat.roughnessMap)
+                            oldMat.roughnessMap.anisotropy = 16;
+                        if (oldMat.normalMap)
+                            oldMat.normalMap.anisotropy = 16;
+                        const hasVC  = !!child.geometry.attributes.color;
+
+                        child.material = new THREE.ShaderMaterial({
+                            lights: true,
+                            uniforms: THREE.UniformsUtils.merge([
+                                THREE.UniformsLib.lights,
+                                {
+                                    map:   { value: oldMat.map },
+                                    hasMap:{ value: !!oldMat.map },
+                                    spec:   { value: oldMat.roughnessMap },
+                                    hasSpec:{ value: !!oldMat.roughnessMap },
+                                    normalMap:    { value: oldMat.normalMap },
+                                    hasNormalMap: { value: !!oldMat.normalMap },
+                                    normalScale:  { value: oldMat.normalScale || new THREE.Vector2(1, 1) },
+                                }
+                            ]),
+                            vertexShader,
+                            fragmentShader,
+                            vertexColors: hasVC,
+                            transparent:  oldMat.transparent,
+                            side:         oldMat.side
+                        });
+                    }
+                });
+                currentModel = gltf.scene;
+                scene.add(currentModel);
+            });
+        }
+
+        window.addEventListener('dragover', e => e.preventDefault());
+        window.addEventListener('drop', e => {
+            e.preventDefault();
+            const file = e.dataTransfer.files[0];
+            if (file) loadModel(URL.createObjectURL(file));
+        });
+
+        window.addEventListener('resize', () => {
+            camera.aspect = innerWidth / innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(innerWidth, innerHeight);
+        });
+
+        (function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        })();
+    </script>
+</body>
+</html>
