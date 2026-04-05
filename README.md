@@ -19,3 +19,9 @@ GLB model viewer (PBR):
 
 Photoshop "Curves" tool interpolation replication experiment:
 - https://wareya.github.io/slopfest-log/html/photoshop-curves-eval-experiment.html
+
+PBR texture previewer:
+- https://wareya.github.io/slopfest-log/html/pbr_previewer.html
+
+PBR texture generator (see also [pbrnet](https://github.com/wareya/pbrnet) -- this is a copy of that, and this copy may become outdated):
+- https://wareya.github.io/slopfest-log/html/pbr_infer.html
