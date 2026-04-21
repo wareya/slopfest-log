@@ -25,3 +25,6 @@ PBR texture previewer:
 
 PBR texture generator (see also [pbrnet](https://github.com/wareya/pbrnet) -- this is a copy of that, and this copy may become outdated):
 - https://wareya.github.io/slopfest-log/html/pbr_infer.html
+
+Safetensors viewer with geometric organization:
+- https://wareya.github.io/slopfest-log/html/safetenview_v2.html
