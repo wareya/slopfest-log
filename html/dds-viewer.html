@@ -14,12 +14,70 @@
 </head>
 <body>
 
-    <h2>DDS Viewer (DXT1/3/5)</h2>
+    <h2>DDS Viewer (DXT1 / DXT3 / DXT5 / BC7)</h2>
     <div id="drop-zone">Drop .dds file here</div>
     <div class="info" id="file-info">Ready.</div>
     <div id="dummy"><canvas id="preview"></canvas></div>
 
 <script>
+    // --- BC7 Decode Tables & Constants ---
+    const BC7_P2_STR = "0011001100110011000100010001000101110111011101110001001100110111000000010001001100110111011111110001001101111111000000010011011100000000000100110011011111111111000000010111111100000000000101110001011111111111000000001111111100001111111111110000000000001111000010001110111101110001000000000000000010001110011100110001000000110001000000000000100011001110000000001000110001110011001100010011000100010000000010001000110001100110011001100011011001101100000101111110100000001111111100000111000110001110001110011001110001010101010101010000111100001111010110100101101000110011110011000011110000111100010101011010101001101001011010010101101010100101011100111100111000010011110010000011001001001100001110111101110001101001100101100011110011000011011001101001100100000110011000000100111001000000001001110010000000000010011100100000010011100100011011001001001100110110110010010110001110011100001110011100011001101100110010010110001100111001011111101000000100011000111001110000111100110011001100111111000000100010111011100100010001110111";
+    const BC7_P2 = new Uint8Array(64 * 16);
+    for (let i = 0; i < BC7_P2_STR.length; i++) BC7_P2[i] = BC7_P2_STR.charCodeAt(i) - 48;
+
+    const BC7_P3_STR = "0011001102212222000100112211222100002001221122110222002200110111000000001122112200110011002200220022002211111111001100112211221100000000111122220000111111112222000011112222222200120012001200120112011201120112012201220122012200110112112212220011200122002220000100110112112201110011200122000000112211221122002200220022111101110111022202220001000122212221000000110122012200001100221022100122012200110000001200121122222201101221122101100000011012211221002211021102002201100110200222220011012201220011000020002211222100000002112212220222002200120011001100120022022201200120012001200000111122220000012012012012012001202012120101200011220011220011001111222200001101010101222222220000000021212121002211220022112200220011002200110220122102201221010122222222010100002121212121210101010101012222022201110222011100021112000211120000211221122112022201110111022200021112111200020110011001102222000000002112211201100110222222220022001100110022002211221122002200000000000021120002000100020001022212220222122201012222222222220111201122012220";
+    const BC7_P3 = new Uint8Array(64 * 16);
+    for (let i = 0; i < BC7_P3_STR.length; i++) BC7_P3[i] = BC7_P3_STR.charCodeAt(i) - 48;
+
+    const BC7_A2 = new Uint8Array([
+        15,15,15,15,15,15,15,15, 15,15,15,15,15,15,15,15,
+        15, 2, 8, 2, 2, 8, 8,15,  2, 8, 2, 2, 8, 8, 2, 2,
+        15,15, 6, 8, 2, 8,15,15,  2, 8, 2, 2, 2,15,15, 6,
+         6, 2, 6, 8,15,15, 2, 2, 15,15,15,15,15, 2, 2,15
+    ]);
+
+    const BC7_A3_2 = new Uint8Array([
+         3, 3,15,15, 8, 3,15,15,  8, 8, 6, 6, 6, 5, 3, 3,
+         3, 3, 8,15, 3, 3, 6,10,  5, 8, 8, 6, 8, 5,15,15,
+         8,15, 3, 5, 6,10, 8,15, 15, 3,15, 5,15,15,15,15,
+         3,15, 5, 5, 5, 8, 5,10,  5,10, 8,13,15,12, 3, 3
+    ]);
+
+    const BC7_A3_3 = new Uint8Array([
+        15, 8, 8, 3,15,15, 3, 8, 15,15,15,15,15,15,15, 8,
+        15, 8,15, 3,15, 8,15, 8,  3,15, 6,10,15,15,10, 8,
+        15, 3,15,10,10, 8, 9,10,  6,15, 8,15, 3, 6, 6, 8,
+        15, 3,15,15,15,15,15,15, 15,15,15,15, 3,15,15, 8
+    ]);
+
+    const BC7_W2 = [0, 21, 43, 64];
+    const BC7_W3 =[0, 9, 18, 27, 37, 46, 55, 64];
+    const BC7_W4 =[0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+
+    class BitReader {
+        constructor(src, offset) {
+            this.src = src;
+            this.offset = offset;
+            this.pos = 0;
+        }
+        read(bits) {
+            if (bits === 0) return 0;
+            let value = 0;
+            let bitsRead = 0;
+            while (bitsRead < bits) {
+                let bytePos = Math.floor(this.pos / 8);
+                if (bytePos >= 16 || this.offset + bytePos >= this.src.length) return value;
+                let bitOffset = this.pos % 8;
+                let bitsToRead = Math.min(bits - bitsRead, 8 - bitOffset);
+                let mask = (1 << bitsToRead) - 1;
+                value |= ((this.src[this.offset + bytePos] >> bitOffset) & mask) << bitsRead;
+                this.pos += bitsToRead;
+                bitsRead += bitsToRead;
+            }
+            return value;
+        }
+    }
+
     const dropZone = document.getElementById('drop-zone');
     const info = document.getElementById('file-info');
     const canvas = document.getElementById('preview');
@@ -45,14 +103,25 @@
         const fourCC = header[21];
         
         let format = "";
+        let dataOffset = 128; // Standard DDS header size
+        
         if (fourCC === 0x31545844) format = "DXT1";
         else if (fourCC === 0x33545844) format = "DXT3";
         else if (fourCC === 0x35545844) format = "DXT5";
-        else return alert("Unsupported format. Only DXT1, 3, and 5 are supported.");
+        else if (fourCC === 0x30315844) { // DX10
+            const dxgiFormat = new Int32Array(buffer, 128, 1)[0];
+            // Format 97=TYPELESS, 98=UNORM, 99=UNORM_SRGB
+            if (dxgiFormat >= 97 && dxgiFormat <= 99) {
+                format = "BC7";
+                dataOffset = 148; // Shift past the 20-byte DDS_HEADER_DXT10
+            } else {
+                return alert(`Unsupported DX10 format. (DXGI_FORMAT: ${dxgiFormat})`);
+            }
+        }
+        else return alert("Unsupported format. Only DXT1, 3, 5, and BC7 are supported.");
 
         info.innerText = `File: ${file.name} | Resolution: ${width}x${height} | Format: ${format}`;
         
-        const dataOffset = 128; // Standard DDS header size
         const pixelData = new Uint8Array(buffer, dataOffset);
         
         const rgba = decompress(pixelData, width, height, format);
@@ -67,22 +136,27 @@
 
         for (let y = 0; y < height; y += 4) {
             for (let x = 0; x < width; x += 4) {
-                let block;
-                if (format === "DXT1") {
-                    block = decodeDXT1(src.subarray(offset, offset + 8));
-                    offset += 8;
-                } else if (format === "DXT3") {
-                    block = decodeDXT3(src.subarray(offset, offset + 16));
+                if (format === "BC7") {
+                    decodeBC7Block(src, offset, dst, x, y, width, height);
                     offset += 16;
                 } else {
-                    block = decodeDXT5(src.subarray(offset, offset + 16));
-                    offset += 16;
-                }
+                    let block;
+                    if (format === "DXT1") {
+                        block = decodeDXT1(src.subarray(offset, offset + 8));
+                        offset += 8;
+                    } else if (format === "DXT3") {
+                        block = decodeDXT3(src.subarray(offset, offset + 16));
+                        offset += 16;
+                    } else {
+                        block = decodeDXT5(src.subarray(offset, offset + 16));
+                        offset += 16;
+                    }
 
-                for (let i = 0; i < 16; i++) {
-                    const px = x + (i % 4), py = y + Math.floor(i / 4);
-                    if (px < width && py < height) {
-                        dst.set(block.subarray(i * 4, i * 4 + 4), (py * width + px) * 4);
+                    for (let i = 0; i < 16; i++) {
+                        const px = x + (i % 4), py = y + Math.floor(i / 4);
+                        if (px < width && py < height) {
+                            dst.set(block.subarray(i * 4, i * 4 + 4), (py * width + px) * 4);
+                        }
                     }
                 }
             }
@@ -90,14 +164,171 @@
         return dst;
     }
 
+    function decodeBC7Block(src, offset, dst, x, y, width, height) {
+        let reader = new BitReader(src, offset);
+        
+        // Mode unary extraction
+        let mode = 0;
+        while (mode < 8 && reader.read(1) === 0) mode++;
+        
+        if (mode === 8) {
+            // Reserved mode (clear out to completely transparent/black)
+            for (let i = 0; i < 16; i++) {
+                let px = x + (i % 4), py = y + Math.floor(i / 4);
+                if (px < width && py < height) {
+                    let outIdx = (py * width + px) * 4;
+                    dst[outIdx] = dst[outIdx+1] = dst[outIdx+2] = dst[outIdx+3] = 0;
+                }
+            }
+            return;
+        }
+
+        let partition = 0, rotation = 0, indexSelection = 0;
+        let colorBits = 0, alphaBits = 0, pBits = 0, indexBits = 0, indexBitsAlpha = 0;
+        let subsets = 1, hasAlpha = false;
+
+        // Extract configuration by mode
+        if (mode === 0) { subsets = 3; partition = reader.read(4); colorBits = 4; pBits = 6; indexBits = 3; }
+        else if (mode === 1) { subsets = 2; partition = reader.read(6); colorBits = 6; pBits = 2; indexBits = 3; }
+        else if (mode === 2) { subsets = 3; partition = reader.read(6); colorBits = 5; pBits = 0; indexBits = 2; }
+        else if (mode === 3) { subsets = 2; partition = reader.read(6); colorBits = 7; pBits = 4; indexBits = 2; }
+        else if (mode === 4) { subsets = 1; rotation = reader.read(2); indexSelection = reader.read(1); colorBits = 5; alphaBits = 6; indexBits = 2; indexBitsAlpha = 3; hasAlpha = true; }
+        else if (mode === 5) { subsets = 1; rotation = reader.read(2); colorBits = 7; alphaBits = 8; indexBits = 2; indexBitsAlpha = 2; hasAlpha = true; }
+        else if (mode === 6) { subsets = 1; colorBits = 7; alphaBits = 7; pBits = 2; indexBits = 4; hasAlpha = true; }
+        else if (mode === 7) { subsets = 2; partition = reader.read(6); colorBits = 5; alphaBits = 5; pBits = 4; indexBits = 2; hasAlpha = true; }
+
+        let numEndpoints = subsets * 2;
+        let epR = new Array(numEndpoints).fill(0), epG = new Array(numEndpoints).fill(0);
+        let epB = new Array(numEndpoints).fill(0), epA = new Array(numEndpoints).fill(255);
+
+        // Read Endpoints by channel sequentially
+        for (let i = 0; i < numEndpoints; i++) epR[i] = reader.read(colorBits);
+        for (let i = 0; i < numEndpoints; i++) epG[i] = reader.read(colorBits);
+        for (let i = 0; i < numEndpoints; i++) epB[i] = reader.read(colorBits);
+        if (hasAlpha) {
+            for (let i = 0; i < numEndpoints; i++) epA[i] = reader.read(alphaBits);
+        }
+
+        // Read P-bits
+        let p = new Array(numEndpoints).fill(-1);
+        if (pBits > 0) {
+            if (mode === 1) {
+                let p0 = reader.read(1), p1 = reader.read(1);
+                p[0] = p[1] = p0;
+                p[2] = p[3] = p1;
+            } else {
+                for (let i = 0; i < numEndpoints; i++) p[i] = reader.read(1);
+            }
+        }
+
+        // Endpoint Dequantization
+        let dequantize = (val, bits, pBit) => {
+            if (bits === 0) return 255;
+            if (bits === 8) return val;
+            let effectiveBits = bits + (pBit !== -1 ? 1 : 0);
+            let v = val;
+            if (pBit !== -1) v = (v << 1) | pBit;
+            return (v << (8 - effectiveBits)) | (v >> (2 * effectiveBits - 8));
+        };
+
+        for (let i = 0; i < numEndpoints; i++) {
+            let pVal = p[i];
+            epR[i] = dequantize(epR[i], colorBits, pVal);
+            epG[i] = dequantize(epG[i], colorBits, pVal);
+            epB[i] = dequantize(epB[i], colorBits, pVal);
+            epA[i] = hasAlpha ? dequantize(epA[i], alphaBits, pVal) : 255;
+        }
+
+        // Parse Primary and Secondary Index Streams
+        let anchors1 = [0], anchors2 = [0];
+        if (subsets === 2) anchors1 =[0, BC7_A2[partition]];
+        else if (subsets === 3) anchors1 =[0, BC7_A3_2[partition], BC7_A3_3[partition]];
+
+        let indices1 = new Array(16), indices2 = new Array(16);
+
+        let getSubset = (i) => {
+            if (subsets === 1) return 0;
+            if (subsets === 2) return BC7_P2[partition * 16 + i];
+            return BC7_P3[partition * 16 + i];
+        };
+
+        for (let i = 0; i < 16; i++) {
+            let s = getSubset(i);
+            let isAnchor = (i === anchors1[s]);
+            indices1[i] = reader.read(indexBits - (isAnchor ? 1 : 0));
+        }
+
+        if (mode === 4 || mode === 5) {
+            for (let i = 0; i < 16; i++) {
+                let isAnchor = (i === anchors2[0]);
+                indices2[i] = reader.read(indexBitsAlpha - (isAnchor ? 1 : 0));
+            }
+        }
+        if (mode === 4 && indexSelection == 1)
+        {
+            let temp = indices2;
+            indices2 = indices1;
+            indices1 = temp;
+            indexBitsAlpha = 2;
+            indexBits = 3;
+        }
+
+        let getWeights = (bits) => {
+            if (bits === 2) return BC7_W2;
+            if (bits === 3) return BC7_W3;
+            if (bits === 4) return BC7_W4;
+            return BC7_W2;
+        };
+
+        let w1 = getWeights(indexBits), w2 = getWeights(indexBitsAlpha);
+        let interp = (e0, e1, w) => Math.floor((e0 * (64 - w) + e1 * w + 32) / 64);
+
+        // Reconstruction
+        for (let i = 0; i < 16; i++) {
+            let s = getSubset(i);
+            let epIdx0 = s * 2, epIdx1 = s * 2 + 1;
+
+            let idxC = indices1[i];
+            let idxA = indices1[i]; // Shared index default
+            let weightC = w1[idxC];
+            let weightA = w1[idxA];
+
+            if (mode === 4 || mode === 5) {
+                idxA = indices2[i];
+                weightA = w2[idxA];
+            }
+
+            let r = interp(epR[epIdx0], epR[epIdx1], weightC);
+            let g = interp(epG[epIdx0], epG[epIdx1], weightC);
+            let b = interp(epB[epIdx0], epB[epIdx1], weightC);
+            let a = hasAlpha ? interp(epA[epIdx0], epA[epIdx1], weightA) : 255;
+
+            // Mode 4 and 5 Rotation swaps A channel with one of the target color components
+            let outR = r, outG = g, outB = b, outA = a;
+            if (rotation === 1) { outR = a; outA = r; }
+            else if (rotation === 2) { outG = a; outA = g; }
+            else if (rotation === 3) { outB = a; outA = b; }
+
+            // Final Write Output
+            let px = x + (i % 4), py = y + Math.floor(i / 4);
+            if (px < width && py < height) {
+                let outIdx = (py * width + px) * 4;
+                dst[outIdx] = outR;
+                dst[outIdx+1] = outG;
+                dst[outIdx+2] = outB;
+                dst[outIdx+3] = outA;
+            }
+        }
+    }
+
     function rgb565(p) {
-        return [((p >> 11) & 31) * 255 / 31, ((p >> 5) & 63) * 255 / 63, (p & 31) * 255 / 31];
+        return[((p >> 11) & 31) * 255 / 31, ((p >> 5) & 63) * 255 / 63, (p & 31) * 255 / 31];
     }
 
     function getColors(block, isDXT1) {
         const c0 = block[0] | (block[1] << 8), c1 = block[2] | (block[3] << 8);
         const r0 = rgb565(c0), r1 = rgb565(c1);
-        const out = [...r0, 255, ...r1, 255];
+        const out =[...r0, 255, ...r1, 255];
         if (!isDXT1 || c0 > c1) {
             out.push((2 * r0[0] + r1[0]) / 3, (2 * r0[1] + r1[1]) / 3, (2 * r0[2] + r1[2]) / 3, 255);
             out.push((r0[0] + 2 * r1[0]) / 3, (r0[1] + 2 * r1[1]) / 3, (r0[2] + 2 * r1[2]) / 3, 255);
@@ -127,7 +358,7 @@
     }
 
     function decodeDXT5(b) {
-        const a0 = b[0], a1 = b[1], alphas = [a0, a1];
+        const a0 = b[0], a1 = b[1], alphas =[a0, a1];
         if (a0 > a1) {
             for (let i = 1; i < 7; i++) alphas.push(((7 - i) * a0 + i * a1) / 7);
         } else {
