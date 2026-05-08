@@ -28,3 +28,5 @@ PBR texture generator (see also [pbrnet](https://github.com/wareya/pbrnet) -- th
 
 Safetensors viewer with geometric organization:
 - https://wareya.github.io/slopfest-log/html/safetenview_v2.html
+
+py/ddslop.py: python/numpy-only library for compressing dds files (DXT1/DXT5/BC7) with mipmaps
