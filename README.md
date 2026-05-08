@@ -8,7 +8,7 @@ This is where I dump random vibecoded garbage.
 Cubemap individual faces to equirectangular panorama converter:
 - https://wareya.github.io/slopfest-log/html/cubemap_faces_to_panorama.html
 
-DDS texture viewer (DXT1 through DXT5):
+DDS texture viewer (DXT1 through DXT5, plus BC7):
 - https://wareya.github.io/slopfest-log/html/dds-viewer.html
 
 GLTF-in-a-zip to GLB converter:
