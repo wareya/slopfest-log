@@ -147,10 +147,10 @@ def _pca_endpoints(pixels, iterations=3, gd_iters=3, indexes=4):
     cx = indexes - 1.0
     
     # Outlier inset: move endpoints towards the mean (1D squish)
-    t0 -= t0 / cx / 5.0 * ratio
-    t1 -= t1 / cx / 5.0 * ratio
+    t0 -= t0 / cx / 8.0 * ratio
+    t1 -= t1 / cx / 8.0 * ratio
     
-    lr = 2.5  # Learning rate
+    lr = 2.0  # Learning rate
 
     for _ in range(gd_iters):
         # 1. Project each pixel onto the t1→t0 line; t_val∈[0,1]
@@ -286,8 +286,9 @@ def _compress_bc3_alpha(blocks):
 
 # ── BC7 (BPTC) compression ────────────────────────────────────────────────────
 #
-# Implements modes 0, 1, 2, 3, 5, 6 — covering 3-subset RGB (P-bit and plain),
-# opaque 2-subset, precise 2-subset, separate-alpha, and single-partition RGBA.
+# Implements modes 0, 1, 2, 3, 4, 5, 6 — covering 3-subset RGB (P-bit and plain),
+# opaque 2-subset, precise 2-subset, separate-alpha (5-bit+6-bit and 7-bit+8-bit),
+# and single-partition RGBA.
 
 # 2-subset partition table (64 partitions × 16 pixels)
 _BC7_P2 = np.array([int(c) for c in (
@@ -562,6 +563,176 @@ def _bc7_mode5(pixels, pca=0):
         _bw(lo, hi, off, 2, ai[:, i]); off += 2
     assert off == 128
     return _bc7_pack(lo, hi), error
+
+# ── BC7 Mode 4  (1 subset, RGB 5bit + A 6bit, 2-bit color / 3-bit alpha idx) ──
+
+def _bc7_mode4_0(pixels, pca=0):
+    """pixels: (n,16,4) float32.  Returns (blocks, error).
+
+    Mode 4 encodes colour at 5-bit precision with 2-bit indices (4 levels) and
+    alpha at 6-bit precision with 3-bit indices (8 levels), using separate index
+    streams.  The higher alpha index resolution makes it competitive with mode 5
+    on blocks that have gradual alpha transitions and relatively flat colour.
+    Rotation and index-selection are fixed to 0 (no channel swap, primary stream
+    carries colour).
+    """
+    n = pixels.shape[0]
+    rgb   = pixels[:, :, :3]
+    alpha = pixels[:, :, 3]
+
+    # ── Colour endpoints: 5-bit, no P-bit, 2-bit indices (4 palette levels) ──
+    e0c, e1c = _pca_endpoints(rgb, iterations=max(pca, 1), indexes=4)
+    c5_0 = _BC7_QUANT[5][np.clip(np.round(e0c), 0, 255).astype(np.int32)]  # (n,3) uint8
+    c5_1 = _BC7_QUANT[5][np.clip(np.round(e1c), 0, 255).astype(np.int32)]
+    dq0  = _BC7_DEQUANT[5][c5_0].astype(np.float32)
+    dq1  = _BC7_DEQUANT[5][c5_1].astype(np.float32)
+
+    # ── Alpha endpoints: 6-bit, no P-bit, 3-bit indices (8 palette levels) ──
+    a0_q = _BC7_QUANT[6][np.clip(np.round(alpha.min(axis=1)), 0, 255).astype(np.int32)]  # (n,) uint8
+    a1_q = _BC7_QUANT[6][np.clip(np.round(alpha.max(axis=1)), 0, 255).astype(np.int32)]
+    dqa0 = _BC7_DEQUANT[6][a0_q].astype(np.float32)  # (n,) float32 (8-bit after dequant)
+    dqa1 = _BC7_DEQUANT[6][a1_q].astype(np.float32)
+
+    # ── Colour indices (2-bit); anchor = pixel 0, MSB suppressed → threshold 2 ──
+    ci = _bc7_project_idx(rgb, dq0, dq1, _BC7_B2)
+    swap_c = ci[:, 0] >= 2
+    ci[swap_c] = np.uint8(3) - ci[swap_c]
+    c5_0, c5_1 = (np.where(swap_c[:, None], c5_1, c5_0),
+                  np.where(swap_c[:, None], c5_0, c5_1))
+    dq0 = _BC7_DEQUANT[5][c5_0].astype(np.float32)
+    dq1 = _BC7_DEQUANT[5][c5_1].astype(np.float32)
+
+    # ── Alpha indices (3-bit); anchor = pixel 0, MSB suppressed → threshold 4 ──
+    # Reshape alpha to (n,16,1) so _bc7_project_idx handles it uniformly.
+    ai = _bc7_project_idx(alpha[:, :, None], dqa0[:, None], dqa1[:, None], _BC7_B3)
+    swap_a = ai[:, 0] >= 4
+    ai[swap_a] = np.uint8(7) - ai[swap_a]
+    a0_q, a1_q = (np.where(swap_a, a1_q, a0_q),
+                  np.where(swap_a, a0_q, a1_q))
+    dqa0 = _BC7_DEQUANT[6][a0_q].astype(np.float32)
+    dqa1 = _BC7_DEQUANT[6][a1_q].astype(np.float32)
+
+    # ── Error ──────────────────────────────────────────────────────────────────
+    cerr  = _bc7_error(rgb, dq0, dq1, ci, _BC7_W2)
+    w_a   = _BC7_W3[ai.astype(np.int32)].astype(np.float32)          # (n, 16)
+    recon_a = np.floor((np.float32(64) - w_a) * dqa0[:, None] +
+                        w_a * dqa1[:, None] + 32) / 64
+    aerr  = ((alpha - recon_a) ** 2).sum(axis=1)
+    error = cerr + aerr
+
+    # ── Pack 128 bits ──────────────────────────────────────────────────────────
+    # Layout:
+    #   [0:4]   mode indicator – bit 4 set (5 bits, value = 0b10000)
+    #   [5:6]   rotation = 0 (2 bits)
+    #   [7]     indexSelection = 0 (1 bit)
+    #   [8:37]  R0,R1,G0,G1,B0,B1 (5 bits each = 30 bits)
+    #   [38:49] A0, A1 (6 bits each = 12 bits)
+    #   [50:80] colour indices – anchor 1 bit + 15x2 bits = 31 bits
+    #   [81:127] alpha indices – anchor 2 bits + 15x3 bits = 47 bits
+    #   Total: 5+2+1+30+12+31+47 = 128
+    lo = np.zeros(n, np.uint64); hi = np.zeros(n, np.uint64)
+    _bw(lo, hi, 0, 5, np.full(n, 1 << 4, np.uint8))               # mode 4
+    _bw(lo, hi, 5, 2, np.zeros(n, np.uint8))                       # rotation = 0
+    _bw(lo, hi, 7, 1, np.zeros(n, np.uint8))                       # indexSelection = 0
+    off = 8
+    for ch in range(3):
+        _bw(lo, hi, off, 5, c5_0[:, ch]); off += 5
+        _bw(lo, hi, off, 5, c5_1[:, ch]); off += 5
+    _bw(lo, hi, off, 6, a0_q); off += 6
+    _bw(lo, hi, off, 6, a1_q); off += 6
+    _bw(lo, hi, off, 1, ci[:, 0]); off += 1                        # colour anchor
+    for i in range(1, 16):
+        _bw(lo, hi, off, 2, ci[:, i]); off += 2
+    _bw(lo, hi, off, 2, ai[:, 0]); off += 2                        # alpha anchor
+    for i in range(1, 16):
+        _bw(lo, hi, off, 3, ai[:, i]); off += 3
+    assert off == 128
+    return _bc7_pack(lo, hi), error
+
+
+# ── BC7 Mode 4  (1 subset, RGB 5bit + A 6bit, 3-bit color / 2-bit alpha idx) ──
+ 
+def _bc7_mode4_1(pixels, pca=0):
+    """pixels: (n,16,4) float32.  Returns (blocks, error).
+ 
+    indexSelection=1: the decoder swaps the two index streams, so the 2-bit
+    primary stream in the bitstream carries alpha and the 3-bit secondary stream
+    carries colour.  This gives colour 8 palette levels (better gradients) at
+    the cost of only 4 alpha levels.  Rotation is fixed to 0 (no channel swap).
+ 
+    Bitstream layout (identical positions regardless of indexSelection):
+      [0:4]   mode indicator – bit 4 set (5 bits, value = 0b10000)
+      [5:6]   rotation = 0 (2 bits)
+      [7]     indexSelection = 1 (1 bit)
+      [8:37]  R0,R1,G0,G1,B0,B1 (5 bits each = 30 bits)
+      [38:49] A0, A1 (6 bits each = 12 bits)
+      [50:80] primary stream – alpha indices, 2-bit each, anchor 1 bit (31 bits)
+      [81:127] secondary stream – colour indices, 3-bit each, anchor 2 bits (47 bits)
+      Total: 5+2+1+30+12+31+47 = 128
+    """
+    n = pixels.shape[0]
+    rgb   = pixels[:, :, :3]
+    alpha = pixels[:, :, 3]
+ 
+    # ── Colour endpoints: 5-bit, no P-bit, 3-bit indices (8 palette levels) ──
+    e0c, e1c = _pca_endpoints(rgb, iterations=max(pca, 1), indexes=8)
+    c5_0 = _BC7_QUANT[5][np.clip(np.round(e0c), 0, 255).astype(np.int32)]  # (n,3) uint8
+    c5_1 = _BC7_QUANT[5][np.clip(np.round(e1c), 0, 255).astype(np.int32)]
+    dq0  = _BC7_DEQUANT[5][c5_0].astype(np.float32)
+    dq1  = _BC7_DEQUANT[5][c5_1].astype(np.float32)
+ 
+    # ── Alpha endpoints: 6-bit, no P-bit, 2-bit indices (4 palette levels) ──
+    a0_q = _BC7_QUANT[6][np.clip(np.round(alpha.min(axis=1)), 0, 255).astype(np.int32)]  # (n,) uint8
+    a1_q = _BC7_QUANT[6][np.clip(np.round(alpha.max(axis=1)), 0, 255).astype(np.int32)]
+    dqa0 = _BC7_DEQUANT[6][a0_q].astype(np.float32)  # (n,) float32 (8-bit after dequant)
+    dqa1 = _BC7_DEQUANT[6][a1_q].astype(np.float32)
+ 
+    # ── Alpha indices (2-bit) → primary stream; anchor pixel 0, threshold 2 ──
+    ai = _bc7_project_idx(alpha[:, :, None], dqa0[:, None], dqa1[:, None], _BC7_B2)
+    swap_a = ai[:, 0] >= 2
+    ai[swap_a] = np.uint8(3) - ai[swap_a]
+    a0_q, a1_q = (np.where(swap_a, a1_q, a0_q),
+                  np.where(swap_a, a0_q, a1_q))
+    dqa0 = _BC7_DEQUANT[6][a0_q].astype(np.float32)
+    dqa1 = _BC7_DEQUANT[6][a1_q].astype(np.float32)
+ 
+    # ── Colour indices (3-bit) → secondary stream; anchor pixel 0, threshold 4 ──
+    ci = _bc7_project_idx(rgb, dq0, dq1, _BC7_B3)
+    swap_c = ci[:, 0] >= 4
+    ci[swap_c] = np.uint8(7) - ci[swap_c]
+    c5_0, c5_1 = (np.where(swap_c[:, None], c5_1, c5_0),
+                  np.where(swap_c[:, None], c5_0, c5_1))
+    dq0 = _BC7_DEQUANT[5][c5_0].astype(np.float32)
+    dq1 = _BC7_DEQUANT[5][c5_1].astype(np.float32)
+ 
+    # ── Error ──────────────────────────────────────────────────────────────────
+    cerr  = _bc7_error(rgb, dq0, dq1, ci, _BC7_W3)
+    w_a   = _BC7_W2[ai.astype(np.int32)].astype(np.float32)          # (n, 16)
+    recon_a = np.floor((np.float32(64) - w_a) * dqa0[:, None] +
+                        w_a * dqa1[:, None] + 32) / 64
+    aerr  = ((alpha - recon_a) ** 2).sum(axis=1)
+    error = cerr + aerr
+ 
+    # ── Pack 128 bits ──────────────────────────────────────────────────────────
+    lo = np.zeros(n, np.uint64); hi = np.zeros(n, np.uint64)
+    _bw(lo, hi, 0, 5, np.full(n, 1 << 4, np.uint8))               # mode 4
+    _bw(lo, hi, 5, 2, np.zeros(n, np.uint8))                       # rotation = 0
+    _bw(lo, hi, 7, 1, np.ones(n,  np.uint8))                       # indexSelection = 1
+    off = 8
+    for ch in range(3):
+        _bw(lo, hi, off, 5, c5_0[:, ch]); off += 5
+        _bw(lo, hi, off, 5, c5_1[:, ch]); off += 5
+    _bw(lo, hi, off, 6, a0_q); off += 6
+    _bw(lo, hi, off, 6, a1_q); off += 6
+    _bw(lo, hi, off, 1, ai[:, 0]); off += 1                        # alpha anchor (primary)
+    for i in range(1, 16):
+        _bw(lo, hi, off, 2, ai[:, i]); off += 2
+    _bw(lo, hi, off, 2, ci[:, 0]); off += 2                        # colour anchor (secondary)
+    for i in range(1, 16):
+        _bw(lo, hi, off, 3, ci[:, i]); off += 3
+    assert off == 128
+    return _bc7_pack(lo, hi), error
+ 
 
 # ── BC7 2-subset partition search (shared by Mode 1 & 3) ─────────────────────
 
@@ -1021,13 +1192,21 @@ def _compress_bc7(blocks_rgba, pca=0, lite=False, nano=False, zero=False):
     pf = blocks_rgba.astype(np.float32)
 
     best_blk, best_err = _bc7_mode6(pf, pca)
+    
+    blk4, err4 = _bc7_mode4_1(pf, pca)
+    better = err4 < best_err
+    best_blk[better] = blk4[better]; best_err[better] = err4[better]
+
+    if zero: return best_blk
+    
+    blk4, err4 = _bc7_mode4_0(pf, pca)
+    better = err4 < best_err
+    best_blk[better] = blk4[better]; best_err[better] = err4[better]
 
     blk5, err5 = _bc7_mode5(pf, pca)
     better = err5 < best_err
     best_blk[better] = blk5[better]; best_err[better] = err5[better]
-    
-    if zero: return best_blk
-    
+
     # Share partition search between modes 1 and 3
     pid = _bc7_best_partition(pf[:,:,:3], pf.shape[0], lite=lite, nano=nano)
     
