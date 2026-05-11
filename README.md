@@ -2,6 +2,9 @@
 
 This is where I dump random vibecoded garbage.
 
+Detextour, a perspective-correct texture-from-photo extractor with seamless tiling and high performance:
+- https://oomfievroomfie.github.io/slopfest-log/html/detextour.html
+
 2D graphing calculator, outputting Z as pixel color:
 - https://oomfievroomfie.github.io/slopfest-log/html/2d_graphing_calc.html
 
