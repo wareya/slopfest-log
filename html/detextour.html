@@ -1,0 +1,1482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Perspective Quad Extractor</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #2b2b2b; color: #ddd; font: 13px/1.4 sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+#views { display: flex; flex: 1; min-height: 0; gap: 4px; padding: 4px 4px 0; }
+canvas { display: block; background: #2e2e2e; }
+#image-view { flex: 3; cursor: crosshair; }
+#preview-view { flex: 2; cursor: default; }
+.bar { display: flex; align-items: center; gap: 6px; padding: 3px 4px; flex-wrap: wrap; }
+.bar label { white-space: nowrap; }
+.bar input[type=number] { width: 60px; background: #3a3a3a; color: #ddd; border: 1px solid #555; padding: 2px 4px; }
+.bar input[type=checkbox] { accent-color: #5af; }
+.bar select { background: #3a3a3a; color: #ddd; border: 1px solid #555; padding: 2px 4px; }
+button { background: #444; color: #ddd; border: 1px solid #666; padding: 3px 10px; cursor: pointer; }
+button:hover { background: #555; }
+button.active { background: #336; border-color: #88f; }
+#fft-panel { display: none; padding: 3px 4px; }
+#fft-grid { display: grid; gap: 2px; cursor: pointer; user-select: none; }
+.fft-cell { width: 22px; height: 22px; background: #323237; display: flex; align-items: center; justify-content: center; font-size: 7px; color: #bbb; border-radius: 2px; }
+.fft-cell.on { background: #50a0dc; color: #fff; }
+.fft-cell.disabled { background: #3c3c3c; color: #5a5a5a; }
+#drop-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 18px; color: #aaa; pointer-events: none; }
+.view-wrap { position: relative; overflow: hidden; }
+</style>
+</head>
+<body>
+
+<div id="views">
+  <div class="view-wrap" style="flex:3">
+    <canvas id="image-view"></canvas>
+    <div id="img-overlay" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:15px;color:#aaa;text-align:center;">
+      Drop an image here<br><br>Scroll to zoom · Middle-drag to pan<br>Drag corners to define quad
+    </div>
+  </div>
+  <div class="view-wrap" style="flex:2">
+    <canvas id="preview-view"></canvas>
+    <div id="prev-overlay" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:14px;color:#8a8a8a;text-align:center;">
+      Tiled texture preview<br><br>Define a quad on the left<br>to extract a tileable texture
+    </div>
+  </div>
+</div>
+
+<div class="bar">
+  <label>Output size:</label>
+  <input type="number" id="out-w" value="512" min="16" max="4096">
+  <label>×</label>
+  <input type="number" id="out-h" value="512" min="16" max="4096">
+  <label>&nbsp;Tiles:</label>
+  <input type="number" id="tiles" value="3" min="1" max="8" style="width:50px">
+  <div style="flex:1"></div>
+  <button id="btn-reset-views">Reset Views</button>
+  <button id="btn-reset-edges">Reset Edges</button>
+  <button id="btn-save-proj">Save Project</button>
+  <button id="btn-load-proj">Load Project</button>
+  <button id="btn-export">Export PNG</button>
+</div>
+
+<div class="bar">
+  <label>Wrap:</label>
+  <input type="checkbox" id="wrap-h"><label for="wrap-h">H</label>
+  <select id="mode-h"><option>Reflect</option><option>Extend</option></select>
+  <label>Fade H:</label>
+  <input type="number" id="fade-h" value="10" min="0" max="100" style="width:55px">%
+  &nbsp;
+  <input type="checkbox" id="wrap-v"><label for="wrap-v">V</label>
+  <select id="mode-v"><option>Reflect</option><option>Extend</option></select>
+  <label>Fade V:</label>
+  <input type="number" id="fade-v" value="10" min="0" max="100" style="width:55px">%
+  <label>&nbsp;Noise str:</label>
+  <input type="number" id="noise-str" value="0" min="0" max="256" style="width:55px">
+  <label>scale:</label>
+  <input type="number" id="noise-scale" value="32" min="1" max="512" style="width:55px">
+</div>
+
+<div class="bar">
+  <button id="btn-fft-toggle">FFT notch ▶</button>
+</div>
+
+<div id="fft-panel">
+  <div id="fft-grid"></div>
+</div>
+
+<input type="file" id="file-input" accept="image/*,.json" style="display:none">
+<input type="file" id="proj-input" accept=".json" style="display:none">
+
+<script>
+'use strict';
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+
+const HANDLE_COLORS = [[1.0,0.2,0.2],[0.2,1.0,0.2],[0.2,0.6,1.0],[1.0,0.8,0.2]];
+const HANDLE_RADIUS = 7;
+const EV_HANDLE_RADIUS = 4;
+const HIT_RADIUS = 16;
+
+const DEFAULT_EDGE_VERTS = [
+  [0.25,0.0],[0.5,0.0],[0.75,0.0],
+  [1.0,0.25],[1.0,0.5],[1.0,0.75],
+  [0.75,1.0],[0.5,1.0],[0.25,1.0],
+  [0.0,0.75],[0.0,0.5],[0.0,0.25],
+];
+
+const CAGE_EDGES = [
+  [0,[0,1,2],1],
+  [1,[3,4,5],2],
+  [2,[6,7,8],3],
+  [3,[9,10,11],0],
+];
+
+// ─── Math helpers ────────────────────────────────────────────────────────────
+
+function solvePersp(dst, src) {
+  const A = [], b = [];
+  for (let i = 0; i < 4; i++) {
+    const [xd,yd] = dst[i], [xs,ys] = src[i];
+    A.push([xd,yd,1,0,0,0,-xs*xd,-xs*yd]); b.push(xs);
+    A.push([0,0,0,xd,yd,1,-ys*xd,-ys*yd]); b.push(ys);
+  }
+  return gaussianElim(A, b);
+}
+
+function gaussianElim(A, b) {
+  const n = b.length;
+  const M = A.map((r,i) => [...r, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let maxRow = col;
+    for (let row = col+1; row < n; row++)
+      if (Math.abs(M[row][col]) > Math.abs(M[maxRow][col])) maxRow = row;
+    [M[col], M[maxRow]] = [M[maxRow], M[col]];
+    if (Math.abs(M[col][col]) < 1e-12) return null;
+    const piv = M[col][col];
+    for (let j = col; j <= n; j++) M[col][j] /= piv;
+    for (let row = 0; row < n; row++) {
+      if (row === col) continue;
+      const f = M[row][col];
+      for (let j = col; j <= n; j++) M[row][j] -= f * M[col][j];
+    }
+  }
+  return M.map(r => r[n]);
+}
+
+function applyPersp(co, x, y) {
+  const [a,b,c,d,e,f,g,h] = co;
+  const denom = g*x + h*y + 1.0;
+  return [(a*x + b*y + c)/denom, (d*x + e*y + f)/denom];
+}
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+let srcImage = null;    // ImageBitmap
+let srcW = 1, srcH = 1;
+let imgPath = null;     // for project save/load (filename only in browser)
+let corners = [];       // 4 [x,y] in source image space
+let edgeVerts = DEFAULT_EDGE_VERTS.map(v=>[...v]);
+let perspFwd = null, perspInv = null;
+
+// ─── Canvases & GL ───────────────────────────────────────────────────────────
+
+const imgCanvas = document.getElementById('image-view');
+const prevCanvas = document.getElementById('preview-view');
+
+// Single WebGL2 context on prevCanvas. Extraction uses FBOs within this context.
+// prevCanvas default framebuffer is used for the preview display.
+const gl = prevCanvas.getContext('webgl2', {preserveDrawingBuffer: true});
+if (!gl) alert('WebGL2 required');
+const prevGl = gl;  // alias — same context
+const hasFloatLinear = !!gl.getExtension('OES_texture_float_linear');
+
+const img2d = imgCanvas.getContext('2d');
+
+// ─── Zoom/pan state ──────────────────────────────────────────────────────────
+
+const imgView = { zoom:1, panX:0, panY:0, panAnchor:null, zoomAnchor:null };
+const prevView = { zoom:1, panX:0, panY:0, panAnchor:null, zoomAnchor:null };
+
+// ─── Preview WebGL setup ─────────────────────────────────────────────────────
+
+const PREV_VERT = `#version 300 es
+out vec2 vPos;
+const vec2 POS[4] = vec2[4](
+  vec2(-1.0,-1.0), vec2(1.0,-1.0), vec2(-1.0,1.0), vec2(1.0,1.0)
+);
+void main() { vPos = POS[gl_VertexID]; gl_Position = vec4(vPos, 0.0, 1.0); }`;
+
+const PREV_FRAG = `#version 300 es
+precision highp float;
+in vec2 vPos;
+uniform sampler2D uTex;
+uniform vec2 uUVScale;   // how many tiles fit across the viewport
+uniform vec2 uUVOffset;  // pan offset in UV space
+uniform float uTiles;
+out vec4 fragColor;
+void main() {
+  vec2 uv = vec2(vPos.x, vPos.y) * 0.5 * uUVScale + uUVOffset;
+  if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(uTiles)))) discard;
+  fragColor = texture(uTex, uv);
+}`;
+
+let prevProg = null, prevVAO = null;
+let prevTexId = null, prevTexW = 1, prevTexH = 1;
+
+function ensurePreviewShader() {
+  if (prevProg) return;
+  function compPrev(type, src) {
+    const s = prevGl.createShader(type);
+    prevGl.shaderSource(s, src);
+    prevGl.compileShader(s);
+    if (!prevGl.getShaderParameter(s, prevGl.COMPILE_STATUS))
+      throw new Error(prevGl.getShaderInfoLog(s));
+    return s;
+  }
+  const vs = compPrev(prevGl.VERTEX_SHADER, PREV_VERT);
+  const fs = compPrev(prevGl.FRAGMENT_SHADER, PREV_FRAG);
+  prevProg = prevGl.createProgram();
+  prevGl.attachShader(prevProg, vs); prevGl.attachShader(prevProg, fs);
+  prevGl.linkProgram(prevProg);
+  prevGl.deleteShader(vs); prevGl.deleteShader(fs);
+  prevVAO = prevGl.createVertexArray();
+}
+
+function updatePreviewTexture(tex, w, h, isFloat) {
+  // tex is already a WebGLTexture in the same context — just set wrap/filter and store it.
+  ensurePreviewShader();
+  prevTexId = tex;
+  prevTexW = w; prevTexH = h;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // Float textures require OES_texture_float_linear for LINEAR; fall back to NEAREST.
+  const filter = (isFloat && !hasFloatLinear) ? gl.NEAREST : gl.LINEAR;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+}
+
+// ─── WebGL extraction shader ─────────────────────────────────────────────────
+
+const VERT_SRC = `#version 300 es
+out vec2 vUV;
+const vec2 POS[4] = vec2[4](
+  vec2(-1.0, -1.0),
+  vec2( 1.0, -1.0),
+  vec2(-1.0,  1.0),
+  vec2( 1.0,  1.0)
+);
+void main() {
+  vec2 pos = POS[gl_VertexID];
+  vUV = vec2((pos.x + 1.0) * 0.5, 1.0 - (pos.y + 1.0) * 0.5);
+  gl_Position = vec4(pos, 0.0, 1.0);
+}`;
+
+const FRAG_SRC = `#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uSrc;
+uniform vec2 uInvImgSize;
+uniform float uPa,uPb,uPc,uPd,uPe,uPf,uPg,uPh;
+uniform vec2 uT0,uT1,uT2,uT3,uT4;
+uniform vec2 uB0,uB1,uB2,uB3,uB4;
+uniform vec2 uL0,uL1,uL2,uL3,uL4;
+uniform vec2 uR0,uR1,uR2,uR3,uR4;
+uniform float uWrapH,uWrapV,uFadePxH,uFadePxV;
+uniform float uNoiseStr,uNoiseScale;
+uniform float uModeExtendH,uModeExtendV;
+uniform vec2 uOutSize;
+out vec4 fragColor;
+
+vec2 evalEdge(vec2 p0,vec2 p1,vec2 p2,vec2 p3,vec2 p4,float t){
+  float s=t*4.0;
+  if(s<1.0)return mix(p0,p1,s);
+  if(s<2.0)return mix(p1,p2,s-1.0);
+  if(s<3.0)return mix(p2,p3,s-2.0);
+  return mix(p3,p4,s-3.0);
+}
+
+vec4 sampleAt(float u,float v,vec2 duvdx,vec2 duvdy){
+  vec2 Pu0=evalEdge(uT0,uT1,uT2,uT3,uT4,u);
+  vec2 Pu1=evalEdge(uB0,uB1,uB2,uB3,uB4,u);
+  vec2 P0v=evalEdge(uL0,uL1,uL2,uL3,uL4,v);
+  vec2 P1v=evalEdge(uR0,uR1,uR2,uR3,uR4,v);
+  vec2 w=(1.0-v)*Pu0+v*Pu1+(1.0-u)*P0v+u*P1v-vec2(u,v);
+  float denom=uPg*w.x+uPh*w.y+1.0;
+  float sx=(uPa*w.x+uPb*w.y+uPc)/denom;
+  float sy=(uPd*w.x+uPe*w.y+uPf)/denom;
+  // Use explicit gradients derived from primary (u,v) to avoid LOD blowup
+  // when sampleAt is called with discontinuous UV (e.g. wrapped coordinates).
+  // Approximate: chain rule through the homography at this point.
+  float invDenom2=1.0/(denom*denom);
+  vec2 dsdx=vec2((uPa*duvdx.x+uPb*duvdx.y)*denom-(uPa*w.x+uPb*w.y+uPc)*(uPg*duvdx.x+uPh*duvdx.y),
+                 (uPd*duvdx.x+uPe*duvdx.y)*denom-(uPd*w.x+uPe*w.y+uPf)*(uPg*duvdx.x+uPh*duvdx.y))*invDenom2;
+  vec2 dsdy=vec2((uPa*duvdy.x+uPb*duvdy.y)*denom-(uPa*w.x+uPb*w.y+uPc)*(uPg*duvdy.x+uPh*duvdy.y),
+                 (uPd*duvdy.x+uPe*duvdy.y)*denom-(uPd*w.x+uPe*w.y+uPf)*(uPg*duvdy.x+uPh*duvdy.y))*invDenom2;
+  return textureGrad(uSrc,vec2(sx,sy)*uInvImgSize,dsdx*uInvImgSize,dsdy*uInvImgSize);
+}
+
+vec2 grad2(float ix,float iy){
+  vec2 p=fract(vec2(ix*0.1031,iy*0.1030));
+  p+=dot(p,p.yx+33.33);
+  float h=fract((p.x+p.y)*p.x);
+  float a=h*6.2831853;
+  return vec2(cos(a),sin(a));
+}
+
+float gradNoise(float x,float y,float scale){
+  float fx=x/scale,fy=y/scale;
+  float ix0=floor(fx),iy0=floor(fy);
+  float tx=fx-ix0,ty=fy-iy0;
+  float ux=tx*tx*(3.0-2.0*tx),uy=ty*ty*(3.0-2.0*ty);
+  float n00=dot(grad2(ix0,iy0),vec2(tx,ty));
+  float n10=dot(grad2(ix0+1.0,iy0),vec2(tx-1.0,ty));
+  float n01=dot(grad2(ix0,iy0+1.0),vec2(tx,ty-1.0));
+  float n11=dot(grad2(ix0+1.0,iy0+1.0),vec2(tx-1.0,ty-1.0));
+  return mix(mix(n00,n10,ux),mix(n01,n11,ux),uy);
+}
+
+float fractalNoise(float x,float y,float wrapX,float wrapY){
+  float tx=wrapX>0.0?clamp((x/wrapX-0.5)*10.0+0.5,0.0,1.0):0.0;
+  float ty=wrapY>0.0?clamp((y/wrapY-0.5)*10.0+0.5,0.0,1.0):0.0;
+  float r=0.0,norm=0.0,amp=1.0,s=uNoiseScale;
+  float n;
+  n=gradNoise(x,y,s);
+  if(wrapX>0.0)n=mix(n,gradNoise(x-wrapX,y,s),tx);
+  if(wrapY>0.0)n=mix(n,gradNoise(x,y-wrapY,s),ty);
+  r+=amp*n;norm+=amp;amp*=0.5;s*=0.5;
+  n=gradNoise(x,y,s);
+  if(wrapX>0.0)n=mix(n,gradNoise(x-wrapX,y,s),tx);
+  if(wrapY>0.0)n=mix(n,gradNoise(x,y-wrapY,s),ty);
+  r+=amp*n;norm+=amp;amp*=0.5;s*=0.5;
+  n=gradNoise(x,y,s);
+  if(wrapX>0.0)n=mix(n,gradNoise(x-wrapX,y,s),tx);
+  if(wrapY>0.0)n=mix(n,gradNoise(x,y-wrapY,s),ty);
+  r+=amp*n;norm+=amp;amp*=0.5;s*=0.5;
+  n=gradNoise(x,y,s);
+  if(wrapX>0.0)n=mix(n,gradNoise(x-wrapX,y,s),tx);
+  if(wrapY>0.0)n=mix(n,gradNoise(x,y-wrapY,s),ty);
+  r+=amp*n;norm+=amp;
+  return r/norm;
+}
+
+void main(){
+  float u=vUV.x,v=vUV.y;
+  float px=u*uOutSize.x,py=v*uOutSize.y;
+  float W=uOutSize.x,H=uOutSize.y;
+
+  float wh=0.0,wv=0.0;
+  if(uWrapH>0.5&&uFadePxH>0.0){
+    if(px<uFadePxH) wh=0.5*(1.0-px/uFadePxH);
+    else if(px>W-uFadePxH) wh=0.5*(px-(W-uFadePxH))/uFadePxH;
+  }
+  if(uWrapV>0.5&&uFadePxV>0.0){
+    if(py<uFadePxV) wv=0.5*(1.0-py/uFadePxV);
+    else if(py>H-uFadePxV) wv=0.5*(py-(H-uFadePxV))/uFadePxV;
+  }
+
+  float dist_h=px<W*0.5?px:px-W;
+  float dist_v=py<H*0.5?py:py-H;
+  float sign_h=px<W*0.5?1.0:-1.0;
+  float sign_v=py<H*0.5?1.0:-1.0;
+
+  if(uNoiseStr>0.0){
+    if(uWrapH>0.5){
+      float n=fractalNoise(dist_h,py,0.0,H)*sign_h;
+      wh=clamp(wh*(1.0+n*uNoiseStr),0.0,1.0);
+    }
+    if(uWrapV>0.5){
+      float n=fractalNoise(px,dist_v,W,0.0)*sign_v;
+      wv=clamp(wv*(1.0+n*uNoiseStr),0.0,1.0);
+    }
+  }
+
+  // Compute gradients from primary (u,v) once — used for all sampleAt calls
+  // to avoid mip LOD blowup when wrapped UVs are discontinuous.
+  vec2 duvdx=dFdx(vec2(u,v));
+  vec2 duvdy=dFdy(vec2(u,v));
+
+  // 2x2 supersample: offset by ±0.25 pixel in output UV space, halved derivatives
+  vec2 ox=duvdx*0.25, oy=duvdy*0.25;
+  vec2 ssdx=duvdx*0.25, ssdy=duvdy*0.25;
+
+  if(wh<0.0001&&wv<0.0001){
+    fragColor=0.25*(sampleAt(u-ox.x-oy.x,v-ox.y-oy.y,ssdx,ssdy)
+                   +sampleAt(u+ox.x-oy.x,v+ox.y-oy.y,ssdx,ssdy)
+                   +sampleAt(u-ox.x+oy.x,v-ox.y+oy.y,ssdx,ssdy)
+                   +sampleAt(u+ox.x+oy.x,v+ox.y+oy.y,ssdx,ssdy));
+    return;
+  }
+
+  float u_h=uModeExtendH>0.5?(px<W*0.5?u+1.0:u-1.0):1.0-u;
+  float v_v=uModeExtendV>0.5?(py<H*0.5?v+1.0:v-1.0):1.0-v;
+
+  // Supersample each blend tap
+  #define SS(uu,vv) (0.25*(sampleAt((uu)-ox.x-oy.x,(vv)-ox.y-oy.y,ssdx,ssdy)\
+                          +sampleAt((uu)+ox.x-oy.x,(vv)+ox.y-oy.y,ssdx,ssdy)\
+                          +sampleAt((uu)-ox.x+oy.x,(vv)-ox.y+oy.y,ssdx,ssdy)\
+                          +sampleAt((uu)+ox.x+oy.x,(vv)+ox.y+oy.y,ssdx,ssdy)))
+  vec4 orig=SS(u,v);
+  vec4 s_h=SS(u_h,v);
+  vec4 s_v=SS(u,v_v);
+  vec4 s_hv=SS(u_h,v_v);
+  #undef SS
+
+  float w_orig=(1.0-wh)*(1.0-wv);
+  float w_h=wh*(1.0-wv);
+  float w_v=(1.0-wh)*wv;
+  float w_hv=wh*wv;
+  float total=w_orig+w_h+w_v+w_hv;
+  fragColor=(w_orig*orig+w_h*s_h+w_v*s_v+w_hv*s_hv)/total;
+}`;
+
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function makeProgram(vsrc, fsrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, vsrc);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(p));
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  return p;
+}
+
+let extractProg = null;
+let extractUniforms = {};
+let extractVAO = null;
+let srcTex = null;
+let srcTexBitmap = null;  // which bitmap is currently uploaded
+let fboTex = null, fbo = null;
+let fboW = 0, fboH = 0;
+
+function ensureShader() {
+  if (extractProg) return;
+  extractProg = makeProgram(VERT_SRC, FRAG_SRC);
+  const names = [
+    'uSrc','uInvImgSize',
+    'uPa','uPb','uPc','uPd','uPe','uPf','uPg','uPh',
+    'uT0','uT1','uT2','uT3','uT4',
+    'uB0','uB1','uB2','uB3','uB4',
+    'uL0','uL1','uL2','uL3','uL4',
+    'uR0','uR1','uR2','uR3','uR4',
+    'uWrapH','uWrapV','uFadePxH','uFadePxV',
+    'uNoiseStr','uNoiseScale','uModeExtendH','uModeExtendV','uOutSize',
+  ];
+  for (const n of names)
+    extractUniforms[n] = gl.getUniformLocation(extractProg, n);
+  extractVAO = gl.createVertexArray();
+}
+
+function ensureSrcTex(bitmap) {
+  if (srcTexBitmap === bitmap) return;
+  if (srcTex) gl.deleteTexture(srcTex);
+  srcTex = gl.createTexture();
+  srcTexBitmap = bitmap;
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  gl.generateMipmap(gl.TEXTURE_2D);
+}
+
+function ensureFBO(w, h) {
+  if (fboW === w && fboH === h) return;
+  if (fbo) { gl.deleteFramebuffer(fbo); gl.deleteTexture(fboTex); }
+  fboTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, fboTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  fboW = w; fboH = h;
+}
+
+// ─── FFT Notch (GPU via ping-pong FBO) ───────────────────────────────────────
+
+const FFT_SIZE = 256;
+const FFT_LOGN = Math.log2(FFT_SIZE); // 8
+
+// Shared fullscreen-quad vert for all FFT passes
+const FFT_VERT = `#version 300 es
+const vec2 POS[4] = vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
+void main(){ gl_Position = vec4(POS[gl_VertexID],0,1); }`;
+
+// Downsample full-res RGBA source to NxN, packing R+G into one rgba32f texture
+// (.rg = R real+imag=0, .ba = G real+imag=0) and B into another (.rg = B re+im=0).
+// Two-pass: horizontal then vertical box filter.
+const FFT_DSAMPLE_H_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc;
+uniform int uSrcW, uDstW, uSrcH;
+layout(location=0) out vec4 oRG;
+layout(location=1) out vec4 oB;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int dx = p.x, row = p.y;
+  if(dx >= uDstW || row >= uSrcH){ oRG=vec4(0); oB=vec4(0); return; }
+  float x0f = float(dx)   * float(uSrcW) / float(uDstW);
+  float x1f = float(dx+1) * float(uSrcW) / float(uDstW);
+  int x0=int(floor(x0f)), x1=int(ceil(x1f));
+  vec3 acc=vec3(0); float ws=0.0;
+  for(int x=x0;x<x1;x++){
+    float wx=min(float(x+1),x1f)-max(float(x),x0f);
+    vec3 c=texelFetch(uSrc,ivec2(clamp(x,0,uSrcW-1),row),0).rgb;
+    acc+=c*wx; ws+=wx;
+  }
+  vec3 v=acc/ws;
+  oRG=vec4(v.r,0,v.g,0);
+  oB=vec4(v.b,0,0,0);
+}`;
+
+const FFT_DSAMPLE_V_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uSrcRG, uSrcB;
+uniform int uSrcH, uDstH, uDstW;
+layout(location=0) out vec4 oRG;
+layout(location=1) out vec4 oB;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int col=p.x, dy=p.y;
+  if(col >= uDstW || dy >= uDstH){ oRG=vec4(0); oB=vec4(0); return; }
+  float y0f = float(dy)   * float(uSrcH) / float(uDstH);
+  float y1f = float(dy+1) * float(uSrcH) / float(uDstH);
+  int y0=int(floor(y0f)), y1=int(ceil(y1f));
+  vec3 acc=vec3(0); float ws=0.0;
+  for(int y=y0;y<y1;y++){
+    float wy=min(float(y+1),y1f)-max(float(y),y0f);
+    float r=texelFetch(uSrcRG,ivec2(col,clamp(y,0,uSrcH-1)),0).r;
+    float g=texelFetch(uSrcRG,ivec2(col,clamp(y,0,uSrcH-1)),0).b;
+    float b=texelFetch(uSrcB, ivec2(col,clamp(y,0,uSrcH-1)),0).r;
+    acc+=vec3(r,g,b)*wy; ws+=wy;
+  }
+  vec3 v=acc/ws;
+  oRG=vec4(v.r,0,v.g,0);
+  oB=vec4(v.b,0,0,0);
+}`;
+
+// Bit-reversal permutation pass: output[k] = input[bitrev(k, logN)]
+const FFT_BITREV_FRAG = (isRow) => `#version 300 es
+precision highp float;
+uniform sampler2D uSrcRG, uSrcB;
+uniform int uN, uLogN;
+layout(location=0) out vec4 oRG;
+layout(location=1) out vec4 oB;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int k     = ${isRow ? 'p.x' : 'p.y'};
+  int other = ${isRow ? 'p.y' : 'p.x'};
+  int rev = 0, x = k;
+  for(int i = 0; i < uLogN; i++){
+    rev = (rev << 1) | (x & 1);
+    x >>= 1;
+  }
+  ivec2 src = ${isRow ? 'ivec2(rev, other)' : 'ivec2(other, rev)'};
+  oRG = texelFetch(uSrcRG, src, 0);
+  oB  = texelFetch(uSrcB,  src, 0);
+}`;
+
+// One Cooley-Tukey DIT butterfly pass over rows or cols.
+// Each output pixel at index k reads from two source pixels determined by the
+// butterfly structure. uHalf is the current sub-FFT half-size (1,2,4,...,N/2).
+const FFT_BUTTERFLY_FRAG = (isRow) => `#version 300 es
+precision highp float;
+uniform sampler2D uSrcRG, uSrcB;
+uniform int uN, uHalf, uInverse;
+const float PI = 3.14159265358979323846;
+layout(location=0) out vec4 oRG;
+layout(location=1) out vec4 oB;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int k     = ${isRow ? 'p.x' : 'p.y'};
+  int other = ${isRow ? 'p.y' : 'p.x'};
+  int span  = uHalf * 2;
+  int group = k / span;
+  int pos   = k % span;       // position within span
+  // upper half of butterfly (pos < uHalf): reads from i0, i1
+  // lower half (pos >= uHalf): also reads from i0, i1 with different sign
+  int i0 = group * span + (pos % uHalf);   // even input
+  int i1 = i0 + uHalf;                     // odd input
+  ivec2 c0 = ${isRow ? 'ivec2(i0, other)' : 'ivec2(other, i0)'};
+  ivec2 c1 = ${isRow ? 'ivec2(i1, other)' : 'ivec2(other, i1)'};
+  vec4 a  = texelFetch(uSrcRG, c0, 0);
+  vec4 b  = texelFetch(uSrcRG, c1, 0);
+  vec4 ab = texelFetch(uSrcB,  c0, 0);
+  vec4 bb = texelFetch(uSrcB,  c1, 0);
+  float ang = float(uInverse==1?1:-1) * 2.0*PI * float(pos % uHalf) / float(span);
+  vec2 tw = vec2(cos(ang), sin(ang));
+  // twiddle b (the odd element)
+  vec2 bR = vec2(b.r*tw.x - b.g*tw.y, b.r*tw.y + b.g*tw.x);
+  vec2 bG = vec2(b.b*tw.x - b.a*tw.y, b.b*tw.y + b.a*tw.x);
+  vec2 bB = vec2(bb.r*tw.x - bb.g*tw.y, bb.r*tw.y + bb.g*tw.x);
+  if(pos < uHalf){
+    oRG = vec4(a.rg + bR, a.ba + bG);
+    oB  = vec4(ab.rg + bB, 0.0, 0.0);
+  } else {
+    oRG = vec4(a.rg - bR, a.ba - bG);
+    oB  = vec4(ab.rg - bB, 0.0, 0.0);
+  }
+}`;
+
+// Zero all bins except kept ones (and their conjugate mirrors)
+const FFT_NOTCH_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uSrcRG, uSrcB;
+uniform ivec2 uBins[64];
+uniform int uNBins, uN;
+layout(location=0) out vec4 oRG;
+layout(location=1) out vec4 oB;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  int fc=p.x, fr=p.y;
+  bool keep=false;
+  for(int i=0;i<uNBins&&!keep;i++){
+    int r=uBins[i].x, c=uBins[i].y;
+    if((fc==((c%uN+uN)%uN)||fc==((-c%uN+uN)%uN))&&
+       (fr==((r%uN+uN)%uN)||fr==((-r%uN+uN)%uN))) keep=true;
+  }
+  if(keep){ oRG=texelFetch(uSrcRG,p,0); oB=texelFetch(uSrcB,p,0); }
+  else { oRG=vec4(0); oB=vec4(0); }
+}`;
+
+// Scale IFFT result by 1/N^2, bilinear-upsample artifact, subtract from source
+const FFT_SUBTRACT_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uSrc, uArtRG, uArtB;
+uniform vec2 uSrcSize, uArtSize;
+uniform float uArtScale;
+out vec4 fragColor;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec2 uv = (vec2(p)+0.5)/uSrcSize;
+  vec2 ap = uv*uArtSize - 0.5;
+  ivec2 a00=ivec2(floor(ap)), a11=a00+ivec2(1);
+  vec2 frac=ap-vec2(a00);
+  a00=clamp(a00,ivec2(0),ivec2(uArtSize)-1);
+  a11=clamp(a11,ivec2(0),ivec2(uArtSize)-1);
+  ivec2 a10=ivec2(a11.x,a00.y), a01=ivec2(a00.x,a11.y);
+  vec4 rg00=texelFetch(uArtRG,a00,0),rg10=texelFetch(uArtRG,a10,0);
+  vec4 rg01=texelFetch(uArtRG,a01,0),rg11=texelFetch(uArtRG,a11,0);
+  vec4 b00=texelFetch(uArtB,a00,0),b10=texelFetch(uArtB,a10,0);
+  vec4 b01=texelFetch(uArtB,a01,0),b11=texelFetch(uArtB,a11,0);
+  // real parts: rg00.r=R, rg00.b=G, b00.r=B (imag in .g/.a)
+  float r=mix(mix(rg00.r,rg10.r,frac.x),mix(rg01.r,rg11.r,frac.x),frac.y);
+  float g=mix(mix(rg00.b,rg10.b,frac.x),mix(rg01.b,rg11.b,frac.x),frac.y);
+  float b=mix(mix(b00.r, b10.r, frac.x),mix(b01.r, b11.r, frac.x),frac.y);
+  vec3 src=texelFetch(uSrc,p,0).rgb;
+  // uArtScale = 1/(N*N) normalizes the unnormalized IFFT output
+  fragColor=vec4(clamp(src - vec3(r,g,b)*uArtScale, 0.0, 1.0), 1.0);
+}`;
+
+// GPU FFT state
+let fftProgs = null;
+let fftTexs = {};   // name -> WebGLTexture
+let fftFBOs = {};   // name -> WebGLFramebuffer  (ping/pong/dsample/out)
+let fftVAO = null;
+let fftLastSize = null;
+
+function fftMakeTex(w, h, ifmt, fmt, type) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt ?? gl.RGBA, type ?? gl.FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+
+function fftMakeFBO2(texA, texB) {
+  const f = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texA, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, texB, 0);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return f;
+}
+
+function fftMakeProg(fsrc) {
+  const vs = compileShader(gl.VERTEX_SHADER, FFT_VERT);
+  const fs = compileShader(gl.FRAGMENT_SHADER, fsrc);
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  gl.deleteShader(vs); gl.deleteShader(fs);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+function ensureFFTProgs() {
+  if (fftProgs) return;
+  if (!gl.getExtension('EXT_color_buffer_float')) throw new Error('EXT_color_buffer_float required');
+  fftProgs = {
+    dsampleH:     fftMakeProg(FFT_DSAMPLE_H_FRAG),
+    dsampleV:     fftMakeProg(FFT_DSAMPLE_V_FRAG),
+    bitrevRow:    fftMakeProg(FFT_BITREV_FRAG(true)),
+    bitrevCol:    fftMakeProg(FFT_BITREV_FRAG(false)),
+    butterflyRow: fftMakeProg(FFT_BUTTERFLY_FRAG(true)),
+    butterflyCol: fftMakeProg(FFT_BUTTERFLY_FRAG(false)),
+    notch:        fftMakeProg(FFT_NOTCH_FRAG),
+    subtract:     fftMakeProg(FFT_SUBTRACT_FRAG),
+  };
+  fftVAO = gl.createVertexArray();
+}
+
+function ensureFFTTextures(W, H) {
+  const N = FFT_SIZE;
+  if (fftLastSize && fftLastSize[0]===W && fftLastSize[1]===H) return;
+  // Clean up old
+  for (const t of Object.values(fftTexs)) gl.deleteTexture(t);
+  for (const f of Object.values(fftFBOs)) gl.deleteFramebuffer(f);
+  fftTexs = {}; fftFBOs = {};
+
+  // Source (RGBA32F copy of extracted image)
+  fftTexs.srcRG  = fftMakeTex(W, H, gl.RGBA32F);  // r=R.re g=R.im b=G.re a=G.im
+  fftTexs.srcB   = fftMakeTex(W, H, gl.RGBA32F);  // r=B.re g=B.im
+  // Intermediate horizontal-downsampled (N wide, H tall)
+  fftTexs.hRG    = fftMakeTex(N, H, gl.RGBA32F);
+  fftTexs.hB     = fftMakeTex(N, H, gl.RGBA32F);
+  // NxN ping-pong pair
+  fftTexs.pingRG = fftMakeTex(N, N, gl.RGBA32F);
+  fftTexs.pingB  = fftMakeTex(N, N, gl.RGBA32F);
+  fftTexs.pongRG = fftMakeTex(N, N, gl.RGBA32F);
+  fftTexs.pongB  = fftMakeTex(N, N, gl.RGBA32F);
+  // Output stays RGBA32F — never integers
+  fftTexs.out    = fftMakeTex(W, H, gl.RGBA32F);
+
+  fftFBOs.hPass  = fftMakeFBO2(fftTexs.hRG,    fftTexs.hB);
+  fftFBOs.ping   = fftMakeFBO2(fftTexs.pingRG,  fftTexs.pingB);
+  fftFBOs.pong   = fftMakeFBO2(fftTexs.pongRG,  fftTexs.pongB);
+  fftFBOs.out    = (() => {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fftTexs.out, 0);
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return f;
+  })();
+
+  fftLastSize = [W, H];
+}
+
+function fftDraw(fbo, w, h) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, w, h);
+  gl.bindVertexArray(fftVAO);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+
+function fftBind2(prog, nameA, texA, nameB, texB) {
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texA);
+  gl.uniform1i(gl.getUniformLocation(prog, nameA), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texB);
+  gl.uniform1i(gl.getUniformLocation(prog, nameB), 1);
+}
+
+// Swap ping/pong so ping always holds the current working data.
+function fftSwapPingPong() {
+  [fftTexs.pingRG, fftTexs.pongRG] = [fftTexs.pongRG, fftTexs.pingRG];
+  [fftTexs.pingB,  fftTexs.pongB]  = [fftTexs.pongB,  fftTexs.pingB];
+  gl.deleteFramebuffer(fftFBOs.ping); gl.deleteFramebuffer(fftFBOs.pong);
+  fftFBOs.ping = fftMakeFBO2(fftTexs.pingRG, fftTexs.pingB);
+  fftFBOs.pong = fftMakeFBO2(fftTexs.pongRG, fftTexs.pongB);
+}
+
+function fftButterfly(isRow, N, inverse) {
+  const logN = Math.round(Math.log2(N));
+
+  // Bit-reversal permutation: ping -> pong, then swap so result is in ping.
+  const brProg = isRow ? fftProgs.bitrevRow : fftProgs.bitrevCol;
+  gl.useProgram(brProg);
+  gl.uniform1i(gl.getUniformLocation(brProg, 'uN'), N);
+  gl.uniform1i(gl.getUniformLocation(brProg, 'uLogN'), logN);
+  fftBind2(brProg, 'uSrcRG', fftTexs.pingRG, 'uSrcB', fftTexs.pingB);
+  fftDraw(fftFBOs.pong, N, N);
+  fftSwapPingPong();  // bit-reversed data is now in ping
+
+  // Butterfly passes: ping -> pong -> ping -> ...
+  const prog = isRow ? fftProgs.butterflyRow : fftProgs.butterflyCol;
+  gl.useProgram(prog);
+  gl.uniform1i(gl.getUniformLocation(prog, 'uN'), N);
+  gl.uniform1i(gl.getUniformLocation(prog, 'uInverse'), inverse ? 1 : 0);
+  for (let half = 1; half <= N/2; half <<= 1) {
+    gl.uniform1i(gl.getUniformLocation(prog, 'uHalf'), half);
+    fftBind2(prog, 'uSrcRG', fftTexs.pingRG, 'uSrcB', fftTexs.pingB);
+    fftDraw(fftFBOs.pong, N, N);
+    fftSwapPingPong();  // result is now in ping
+  }
+  // Result is in ping after the final swap.
+}
+
+function applyFFTNotchGPU(srcFboTex, W, H, activeBins) {
+  const N = FFT_SIZE;
+  ensureFFTProgs();
+  ensureFFTTextures(W, H);
+
+  // --- Ingest source into float texture ---
+  // We can read from srcFboTex (the extraction FBO tex) directly in a shader.
+  // Use the dsampleH pass for that: it reads RGBA and outputs to hRG+hB.
+  const pH = fftProgs.dsampleH;
+  gl.useProgram(pH);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcFboTex);
+  gl.uniform1i(gl.getUniformLocation(pH, 'uSrc'), 0);
+  gl.uniform1i(gl.getUniformLocation(pH, 'uSrcW'), W);
+  gl.uniform1i(gl.getUniformLocation(pH, 'uDstW'), N);
+  gl.uniform1i(gl.getUniformLocation(pH, 'uSrcH'), H);
+  fftDraw(fftFBOs.hPass, N, H);
+
+  // --- Vertical downsample hRG+hB -> pingRG+pingB (NxN) ---
+  const pV = fftProgs.dsampleV;
+  gl.useProgram(pV);
+  fftBind2(pV, 'uSrcRG', fftTexs.hRG, 'uSrcB', fftTexs.hB);
+  gl.uniform1i(gl.getUniformLocation(pV, 'uSrcH'), H);
+  gl.uniform1i(gl.getUniformLocation(pV, 'uDstH'), N);
+  gl.uniform1i(gl.getUniformLocation(pV, 'uDstW'), N);
+  fftDraw(fftFBOs.ping, N, N);
+
+  // --- Forward FFT rows then cols ---
+  fftButterfly(true,  N, false);
+  fftButterfly(false, N, false);
+
+  // --- Notch: zero non-kept bins, result -> pong ---
+  const bins = activeBins;
+  const binsFlat = new Int32Array(bins.length * 2);
+  bins.forEach(([r,c],i) => { binsFlat[i*2]=r; binsFlat[i*2+1]=c; });
+  const pN = fftProgs.notch;
+  gl.useProgram(pN);
+  fftBind2(pN, 'uSrcRG', fftTexs.pingRG, 'uSrcB', fftTexs.pingB);
+  gl.uniform1i(gl.getUniformLocation(pN, 'uN'), N);
+  gl.uniform1i(gl.getUniformLocation(pN, 'uNBins'), bins.length);
+  gl.uniform2iv(gl.getUniformLocation(pN, 'uBins'), binsFlat);
+  fftDraw(fftFBOs.pong, N, N);
+  // Swap so result is in ping
+  [fftTexs.pingRG, fftTexs.pongRG] = [fftTexs.pongRG, fftTexs.pingRG];
+  [fftTexs.pingB,  fftTexs.pongB]  = [fftTexs.pongB,  fftTexs.pingB];
+  gl.deleteFramebuffer(fftFBOs.ping); gl.deleteFramebuffer(fftFBOs.pong);
+  fftFBOs.ping = fftMakeFBO2(fftTexs.pingRG, fftTexs.pingB);
+  fftFBOs.pong = fftMakeFBO2(fftTexs.pongRG, fftTexs.pongB);
+
+  // --- Inverse FFT cols then rows ---
+  fftButterfly(false, N, true);
+  fftButterfly(true,  N, true);
+
+  // --- Subtract artifact from source (bilinear upsample + subtract) ---
+  const pS = fftProgs.subtract;
+  gl.useProgram(pS);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcFboTex);
+  gl.uniform1i(gl.getUniformLocation(pS, 'uSrc'), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fftTexs.pingRG);
+  gl.uniform1i(gl.getUniformLocation(pS, 'uArtRG'), 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, fftTexs.pingB);
+  gl.uniform1i(gl.getUniformLocation(pS, 'uArtB'), 2);
+  gl.uniform2f(gl.getUniformLocation(pS, 'uSrcSize'), W, H);
+  gl.uniform2f(gl.getUniformLocation(pS, 'uArtSize'), N, N);
+  gl.uniform1f(gl.getUniformLocation(pS, 'uArtScale'), 1.0 / (N * N));
+  fftDraw(fftFBOs.out, W, H);
+
+  return fftTexs.out;  // caller uses this texture directly for preview/export
+}
+
+// ─── FFT Grid UI ─────────────────────────────────────────────────────────────
+
+const FFT_ROWS = 8, FFT_COLS = 8;
+const fftState = Array.from({length:FFT_ROWS},()=>new Array(FFT_COLS).fill(false));
+let fftDragValue = null;
+
+function buildFFTGrid() {
+  const grid = document.getElementById('fft-grid');
+  grid.style.gridTemplateColumns = `repeat(${FFT_COLS},22px)`;
+  for (let r = 0; r < FFT_ROWS; r++) {
+    for (let c = 0; c < FFT_COLS; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'fft-cell' + (r===0&&c===0?' disabled':'');
+      cell.textContent = `${r},${c}`;
+      cell.dataset.r = r; cell.dataset.c = c;
+      grid.appendChild(cell);
+    }
+  }
+  grid.addEventListener('mousedown', fftMouseDown);
+  grid.addEventListener('mousemove', fftMouseMove);
+  window.addEventListener('mouseup', () => { fftDragValue = null; });
+}
+
+function fftCellAt(e) {
+  const el = e.target.closest('.fft-cell');
+  if (!el) return null;
+  return [+el.dataset.r, +el.dataset.c];
+}
+
+function setFFTCell(r, c, val) {
+  if (r===0&&c===0) return;
+  if (fftState[r][c] === val) return;
+  fftState[r][c] = val;
+  updateFFTGrid();
+  scheduleRefresh();
+}
+
+function updateFFTGrid() {
+  const cells = document.querySelectorAll('.fft-cell');
+  let i = 0;
+  for (let r = 0; r < FFT_ROWS; r++) for (let c = 0; c < FFT_COLS; c++) {
+    const cell = cells[i++];
+    cell.className = 'fft-cell' + (r===0&&c===0?' disabled':fftState[r][c]?' on':'');
+  }
+}
+
+function fftMouseDown(e) {
+  if (e.button !== 0) return;
+  const rc = fftCellAt(e);
+  if (!rc) return;
+  const [r,c] = rc;
+  if (r===0&&c===0) return;
+  fftDragValue = !fftState[r][c];
+  setFFTCell(r, c, fftDragValue);
+}
+
+function fftMouseMove(e) {
+  if (fftDragValue === null || !(e.buttons&1)) return;
+  const rc = fftCellAt(e);
+  if (!rc) return;
+  setFFTCell(rc[0], rc[1], fftDragValue);
+}
+
+function activeFftBins() {
+  const bins = [];
+  for (let r = 0; r < FFT_ROWS; r++)
+    for (let c = 0; c < FFT_COLS; c++)
+      if (fftState[r][c]) bins.push([r,c]);
+  return bins;
+}
+
+// ─── Extraction ──────────────────────────────────────────────────────────────
+
+let lastExtractedW = 0, lastExtractedH = 0;
+let lastExtractedFbo = null, lastExtractedTex = null;
+
+function getSeamKwargs() {
+  const W = +document.getElementById('out-w').value;
+  const H = +document.getElementById('out-h').value;
+  return {
+    wrap_h: document.getElementById('wrap-h').checked,
+    wrap_v: document.getElementById('wrap-v').checked,
+    mode_h: document.getElementById('mode-h').value === 'Reflect' ? 'reflect' : 'extend',
+    mode_v: document.getElementById('mode-v').value === 'Reflect' ? 'reflect' : 'extend',
+    fade_px_h: Math.round(+document.getElementById('fade-h').value / 100.0 * W),
+    fade_px_v: Math.round(+document.getElementById('fade-v').value / 100.0 * H),
+    noise_str: (+document.getElementById('noise-str').value / 5.0) ** 2.0,
+    noise_scale: +document.getElementById('noise-scale').value,
+  };
+}
+
+function runExtract() {
+  if (!srcImage || corners.length !== 4) return;
+  const outW = +document.getElementById('out-w').value;
+  const outH = +document.getElementById('out-h').value;
+  const kw = getSeamKwargs();
+
+  ensureShader();
+  ensureSrcTex(srcImage);
+  ensureFBO(outW, outH);
+  // Solve perspective: normalized output [0,1]^2 -> source pixel coords
+  const dst = [[0,0],[1,0],[1,1],[0,1]];
+  const co = solvePersp(dst, corners);
+  if (!co) return;
+  const [pa,pb,pc,pd,pe,pf,pg,ph] = co;
+
+  const C = [[0,0],[1,0],[1,1],[0,1]];
+  const ev = edgeVerts;
+  const edges = {
+    T: [C[0], ev[0],  ev[1],  ev[2],  C[1]],
+    B: [C[3], ev[8],  ev[7],  ev[6],  C[2]],
+    L: [C[0], ev[11], ev[10], ev[9],  C[3]],
+    R: [C[1], ev[3],  ev[4],  ev[5],  C[2]],
+  };
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.viewport(0, 0, outW, outH);
+  gl.useProgram(extractProg);
+
+  const u = extractUniforms;
+  gl.uniform1i(u.uSrc, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, srcTex);
+  gl.uniform2f(u.uInvImgSize, 1.0/srcW, 1.0/srcH);
+  gl.uniform1f(u.uPa, pa); gl.uniform1f(u.uPb, pb); gl.uniform1f(u.uPc, pc);
+  gl.uniform1f(u.uPd, pd); gl.uniform1f(u.uPe, pe); gl.uniform1f(u.uPf, pf);
+  gl.uniform1f(u.uPg, pg); gl.uniform1f(u.uPh, ph);
+
+  for (const [name, pts] of Object.entries(edges)) {
+    for (let i = 0; i < 5; i++) {
+      gl.uniform2f(u[`u${name}${i}`], pts[i][0], pts[i][1]);
+    }
+  }
+
+  const fpxH = Math.min(kw.fade_px_h, outW>>1);
+  const fpxV = Math.min(kw.fade_px_v, outH>>1);
+  gl.uniform1f(u.uWrapH, kw.wrap_h ? 1 : 0);
+  gl.uniform1f(u.uWrapV, kw.wrap_v ? 1 : 0);
+  gl.uniform1f(u.uFadePxH, fpxH);
+  gl.uniform1f(u.uFadePxV, fpxV);
+  gl.uniform1f(u.uNoiseStr, kw.noise_str);
+  gl.uniform1f(u.uNoiseScale, kw.noise_scale);
+  gl.uniform1f(u.uModeExtendH, kw.mode_h === 'extend' ? 1 : 0);
+  gl.uniform1f(u.uModeExtendV, kw.mode_v === 'extend' ? 1 : 0);
+  gl.uniform2f(u.uOutSize, outW, outH);
+
+  gl.bindVertexArray(extractVAO);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+
+  // Determine which GPU texture to display/export
+  const bins = activeFftBins();
+  let previewTex, previewFbo;
+  if (bins.length > 0) {
+    previewTex = applyFFTNotchGPU(fboTex, outW, outH, bins);
+    previewFbo = fftFBOs.out;
+  } else {
+    previewTex = fboTex;
+    previewFbo = fbo;
+  }
+
+  lastExtractedW = outW;
+  lastExtractedH = outH;
+  lastExtractedFbo = previewFbo;
+  lastExtractedTex = previewTex;
+
+  // Upload to preview (stays on GPU via prevGl texture)
+  updatePreviewTexture(previewTex, outW, outH, bins.length > 0);
+  document.getElementById('prev-overlay').style.display = 'none';
+  drawPreview();
+}
+
+let refreshPending = false;
+function scheduleRefresh() {
+  if (refreshPending) return;
+  refreshPending = true;
+  requestAnimationFrame(() => { refreshPending = false; runExtract(); });
+}
+
+// ─── Image view drawing ──────────────────────────────────────────────────────
+
+function imgTransform() {
+  const vw = imgCanvas.width, vh = imgCanvas.height;
+  const base = Math.min(vw / srcW, vh / srcH);
+  const scale = base * imgView.zoom;
+  const cx = vw/2 + imgView.panX, cy = vh/2 + imgView.panY;
+  return {cx, cy, scale};
+}
+
+function imgToScreen([ix, iy]) {
+  const {cx, cy, scale} = imgTransform();
+  return [cx + (ix - srcW/2)*scale, cy + (iy - srcH/2)*scale];
+}
+
+function screenToImg(sx, sy) {
+  const {cx, cy, scale} = imgTransform();
+  return [srcW/2 + (sx-cx)/scale, srcH/2 + (sy-cy)/scale];
+}
+
+function evToImg(u, v) {
+  if (!perspFwd) return null;
+  return applyPersp(perspFwd, u, v);  // returns pixel coords
+}
+
+function imgToEv(ix, iy) {
+  if (!perspInv) return null;
+  return applyPersp(perspInv, ix, iy);  // pixel coords -> normalized output
+}
+
+function updatePersp() {
+  if (corners.length !== 4) { perspFwd = perspInv = null; return; }
+  const norm = [[0,0],[1,0],[1,1],[0,1]];
+  perspFwd = solvePersp(norm, corners);   // normalized output -> pixel coords
+  perspInv = solvePersp(corners, norm);   // pixel coords -> normalized output
+}
+
+function drawImageView() {
+  const c = imgCanvas, ctx = img2d;
+  const vw = c.width, vh = c.height;
+  ctx.fillStyle = '#2e2e2e';
+  ctx.fillRect(0, 0, vw, vh);
+
+  if (!srcImage) return;
+
+  const {cx, cy, scale} = imgTransform();
+  const dw = srcW * scale, dh = srcH * scale;
+  const dx = cx - dw/2, dy = cy - dh/2;
+
+  ctx.drawImage(srcImage, dx, dy, dw, dh);
+
+  if (corners.length !== 4 || !perspFwd) return;
+
+  const cScreen = corners.map(imgToScreen);
+  const evImg = edgeVerts.map(([u,v]) => evToImg(u,v));
+  const evScreen = evImg.map(p => p ? imgToScreen(p) : null);
+
+  // Cage edges
+  ctx.strokeStyle = 'rgba(255,255,50,0.9)';
+  ctx.lineWidth = 2;
+  for (const [c0, evIdxs, c1] of CAGE_EDGES) {
+    const pts = [cScreen[c0], ...evIdxs.map(i=>evScreen[i]), cScreen[c1]];
+    if (pts.some(p=>!p)) continue;
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+  }
+
+  // Edge vert handles
+  ctx.fillStyle = '#fff';
+  const r = EV_HANDLE_RADIUS;
+  for (const p of evScreen) {
+    if (!p) continue;
+    ctx.fillRect(p[0]-r, p[1]-r, 2*r, 2*r);
+  }
+
+  // Corner handles
+  const hr = HANDLE_RADIUS;
+  for (let i = 0; i < 4; i++) {
+    const [sx, sy] = cScreen[i];
+    const [R,G,B] = HANDLE_COLORS[i];
+    ctx.fillStyle = `rgb(${Math.round(R*255)},${Math.round(G*255)},${Math.round(B*255)})`;
+    ctx.fillRect(sx-hr, sy-hr, 2*hr, 2*hr);
+  }
+}
+
+// ─── Preview drawing ──────────────────────────────────────────────────────────
+
+function drawPreview() {
+  const vw = prevCanvas.width, vh = prevCanvas.height;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, vw, vh);
+  gl.clearColor(0.12, 0.12, 0.12, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  if (!prevTexId) return;
+
+  const n = +document.getElementById('tiles').value;
+  const base = Math.min(vw / (prevTexW * n), vh / (prevTexH * n));
+  const scale = base * prevView.zoom;
+  const tw = prevTexW * scale, th = prevTexH * scale;
+
+  const uvScaleX = vw / tw, uvScaleY = vh / th;
+  const uvOffX = n / 2 - prevView.panX / tw;
+  const uvOffY = n / 2 + prevView.panY / th;
+
+  ensurePreviewShader();
+  gl.useProgram(prevProg);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, prevTexId);
+  gl.uniform1i(gl.getUniformLocation(prevProg, 'uTex'), 0);
+  gl.uniform2f(gl.getUniformLocation(prevProg, 'uUVScale'), uvScaleX, uvScaleY);
+  gl.uniform2f(gl.getUniformLocation(prevProg, 'uUVOffset'), uvOffX, uvOffY);
+  gl.uniform1f(gl.getUniformLocation(prevProg, 'uTiles'), n);
+  gl.bindVertexArray(prevVAO);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindVertexArray(null);
+}
+
+// ─── Canvas resize ────────────────────────────────────────────────────────────
+
+function resizeCanvases() {
+  const iw = imgCanvas.parentElement, pw = prevCanvas.parentElement;
+  imgCanvas.width  = iw.clientWidth;  imgCanvas.height  = iw.clientHeight;
+  prevCanvas.width = pw.clientWidth;  prevCanvas.height = pw.clientHeight;
+  drawImageView();
+  drawPreview();
+}
+
+new ResizeObserver(resizeCanvases).observe(document.getElementById('views'));
+
+// ─── Drag interaction ─────────────────────────────────────────────────────────
+
+let dragIdx = -1; // -1:none, 0-3:corner, 4-15:edge vert
+
+function hitTest(sx, sy) {
+  let best = -1, bestD = HIT_RADIUS ** 2;
+  for (let i = 0; i < corners.length; i++) {
+    const [px, py] = imgToScreen(corners[i]);
+    const d = (sx-px)**2 + (sy-py)**2;
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  if (perspFwd) {
+    for (let i = 0; i < edgeVerts.length; i++) {
+      const ip = evToImg(...edgeVerts[i]);
+      if (!ip) continue;
+      const [px, py] = imgToScreen(ip);
+      const d = (sx-px)**2 + (sy-py)**2;
+      if (d < bestD) { bestD = d; best = 4+i; }
+    }
+  }
+  return best;
+}
+
+imgCanvas.addEventListener('mousedown', e => {
+  if (e.button === 1 || (e.button===0 && e.altKey && !e.ctrlKey)) {
+    imgView.panAnchor = [e.offsetX, e.offsetY, imgView.panX, imgView.panY];
+    return;
+  }
+  if (e.button===0 && e.ctrlKey && !e.altKey) {
+    imgView.zoomAnchor = [e.offsetX, e.offsetY, imgView.zoom, imgView.panX, imgView.panY];
+    return;
+  }
+  if (e.button !== 0 || !srcImage) return;
+  dragIdx = hitTest(e.offsetX, e.offsetY);
+});
+
+imgCanvas.addEventListener('mousemove', e => {
+  if (imgView.panAnchor && (e.buttons & (1|4))) {
+    const [ax,ay,apx,apy] = imgView.panAnchor;
+    imgView.panX = apx + e.offsetX - ax;
+    imgView.panY = apy + e.offsetY - ay;
+    drawImageView(); return;
+  }
+  if (imgView.zoomAnchor && (e.buttons & 1)) {
+    const [mx, my, sz, spx, spy] = imgView.zoomAnchor;
+    const factor = 1.015 ** (my - e.offsetY);
+    imgView.zoom = Math.max(0.05, Math.min(200, sz * factor));
+    const hw = imgCanvas.width/2, hh = imgCanvas.height/2;
+    imgView.panX = (mx - hw) * (1 - factor) + spx * factor;
+    imgView.panY = (my - hh) * (1 - factor) + spy * factor;
+    drawImageView(); return;
+  }
+  if (dragIdx < 0 || !(e.buttons & 1)) return;
+  const [ix, iy] = screenToImg(e.offsetX, e.offsetY);
+  if (dragIdx < 4) {
+    corners[dragIdx] = [Math.max(0,Math.min(srcW,ix)), Math.max(0,Math.min(srcH,iy))];
+    updatePersp();
+  } else {
+    const uv = imgToEv(ix, iy);
+    if (uv) edgeVerts[dragIdx-4] = uv;
+  }
+  drawImageView();
+  scheduleRefresh();
+});
+
+imgCanvas.addEventListener('mouseup', e => {
+  imgView.panAnchor = null; imgView.zoomAnchor = null; dragIdx = -1;
+});
+
+imgCanvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (!srcImage) return;
+  const factor = e.deltaY < 0 ? 1.15 : 1/1.15;
+  const mx = e.offsetX, my = e.offsetY;
+  const hw = imgCanvas.width/2, hh = imgCanvas.height/2;
+  imgView.panX = (mx-hw)*(1-factor) + imgView.panX*factor;
+  imgView.panY = (my-hh)*(1-factor) + imgView.panY*factor;
+  imgView.zoom = Math.max(0.05, Math.min(200, imgView.zoom * factor));
+  drawImageView();
+}, {passive:false});
+
+prevCanvas.addEventListener('mousedown', e => {
+  if (e.button === 1 || (e.button===0 && e.altKey && !e.ctrlKey))
+    prevView.panAnchor = [e.offsetX, e.offsetY, prevView.panX, prevView.panY];
+  if (e.button===0 && e.ctrlKey && !e.altKey)
+    prevView.zoomAnchor = [e.offsetX, e.offsetY, prevView.zoom, prevView.panX, prevView.panY];
+});
+prevCanvas.addEventListener('mousemove', e => {
+  if (prevView.panAnchor && (e.buttons & (1|4))) {
+    const [ax,ay,apx,apy] = prevView.panAnchor;
+    prevView.panX = apx + e.offsetX - ax; prevView.panY = apy + e.offsetY - ay;
+    drawPreview(); return;
+  }
+  if (prevView.zoomAnchor && (e.buttons & 1)) {
+    const [mx, my, sz, spx, spy] = prevView.zoomAnchor;
+    const factor = 1.015 ** (my - e.offsetY);
+    prevView.zoom = Math.max(0.05, Math.min(200, sz * factor));
+    const hw = prevCanvas.width/2, hh = prevCanvas.height/2;
+    prevView.panX = (mx - hw) * (1 - factor) + spx * factor;
+    prevView.panY = (my - hh) * (1 - factor) + spy * factor;
+    drawPreview();
+  }
+});
+prevCanvas.addEventListener('mouseup', () => { prevView.panAnchor = null; prevView.zoomAnchor = null; });
+prevCanvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  if (!prevTexId) return;
+  const factor = e.deltaY < 0 ? 1.15 : 1/1.15;
+  const mx = e.offsetX, my = e.offsetY;
+  const hw = prevCanvas.width/2, hh = prevCanvas.height/2;
+  prevView.panX = (mx-hw)*(1-factor) + prevView.panX*factor;
+  prevView.panY = (my-hh)*(1-factor) + prevView.panY*factor;
+  prevView.zoom = Math.max(0.05, Math.min(200, prevView.zoom * factor));
+  drawPreview();
+}, {passive:false});
+
+// ─── Image loading ─────────────────────────────────────────────────────────────
+
+async function loadImageFile(file) {
+  imgPath = file.name;
+  const bmp = await createImageBitmap(file);
+  srcImage = bmp;
+  srcW = bmp.width; srcH = bmp.height;
+  corners = [[0,0],[srcW,0],[srcW,srcH],[0,srcH]];
+  edgeVerts = DEFAULT_EDGE_VERTS.map(v=>[...v]);
+  imgView.zoom = 1; imgView.panX = 0; imgView.panY = 0;
+  updatePersp();
+  document.getElementById('img-overlay').style.display = 'none';
+  ensureSrcTex(srcImage);
+  drawImageView();
+  scheduleRefresh();
+}
+
+// ─── Drag and drop ───────────────────────────────────────────────────────────
+
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  const files = [...e.dataTransfer.files];
+  if (!files.length) return;
+  const f = files[0];
+  if (f.name.endsWith('.json')) loadProjectFromFile(f);
+  else loadImageFile(f);
+});
+
+// ─── Controls ───────────────────────────────────────────────────────────────
+
+for (const id of ['out-w','out-h','fade-h','fade-v','noise-str','noise-scale','wrap-h','wrap-v','mode-h','mode-v'])
+  document.getElementById(id).addEventListener('change', scheduleRefresh);
+
+document.getElementById('tiles').addEventListener('change', drawPreview);
+
+document.getElementById('btn-reset-views').addEventListener('click', () => {
+  imgView.zoom = 1; imgView.panX = 0; imgView.panY = 0;
+  prevView.zoom = 1; prevView.panX = 0; prevView.panY = 0;
+  drawImageView(); drawPreview();
+});
+
+document.getElementById('btn-reset-edges').addEventListener('click', () => {
+  edgeVerts = DEFAULT_EDGE_VERTS.map(v=>[...v]);
+  drawImageView(); scheduleRefresh();
+});
+
+document.getElementById('btn-export').addEventListener('click', () => {
+  if (!lastExtractedFbo) return;
+  const W = lastExtractedW, H = lastExtractedH;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, lastExtractedFbo);
+  // FFT output FBO is RGBA32F; plain extraction FBO is RGBA8.
+  const isFloat = lastExtractedFbo === fftFBOs.out;
+  let pixels;
+  if (isFloat) {
+    const raw = new Float32Array(W * H * 4);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.FLOAT, raw);
+    pixels = new Uint8ClampedArray(W * H * 4);
+    for (let i = 0; i < raw.length; i++)
+      pixels[i] = Math.round(Math.max(0, Math.min(1, raw[i])) * 255);
+  } else {
+    const raw = new Uint8Array(W * H * 4);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, raw);
+    pixels = new Uint8ClampedArray(raw.buffer);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  // Flip vertically (GL origin is bottom-left)
+  const flipped = new Uint8ClampedArray(W * H * 4);
+  for (let y = 0; y < H; y++) {
+    const srcOff = (H - 1 - y) * W * 4;
+    flipped.set(pixels.subarray(srcOff, srcOff + W * 4), y * W * 4);
+  }
+  const tmp = document.createElement('canvas');
+  tmp.width = W; tmp.height = H;
+  tmp.getContext('2d').putImageData(new ImageData(flipped, W, H), 0, 0);
+  const a = document.createElement('a');
+  a.download = 'extracted.png';
+  a.href = tmp.toDataURL('image/png');
+  a.click();
+});
+
+document.getElementById('btn-save-proj').addEventListener('click', () => {
+  if (!srcImage || corners.length !== 4) return;
+  const W = +document.getElementById('out-w').value;
+  const H = +document.getElementById('out-h').value;
+  const proj = {
+    image: imgPath || 'image.jpg',
+    corners: corners,
+    edge_verts: edgeVerts,
+    output_size: [W, H],
+    tiles: +document.getElementById('tiles').value,
+    wrap_h: document.getElementById('wrap-h').checked,
+    wrap_v: document.getElementById('wrap-v').checked,
+    wrap_mode_h: document.getElementById('mode-h').value === 'Reflect' ? 'reflect' : 'extend',
+    wrap_mode_v: document.getElementById('mode-v').value === 'Reflect' ? 'reflect' : 'extend',
+    fade_pct_h: +document.getElementById('fade-h').value,
+    fade_pct_v: +document.getElementById('fade-v').value,
+    noise_str: +document.getElementById('noise-str').value,
+    noise_scale: +document.getElementById('noise-scale').value,
+  };
+  const blob = new Blob([JSON.stringify(proj, null, 2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.download = 'project.json';
+  a.href = URL.createObjectURL(blob);
+  a.click();
+});
+
+document.getElementById('btn-load-proj').addEventListener('click', () => {
+  document.getElementById('proj-input').click();
+});
+
+document.getElementById('proj-input').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  loadProjectFromFile(f);
+  e.target.value = '';
+});
+
+async function loadProjectFromFile(file) {
+  const text = await file.text();
+  let proj;
+  try { proj = JSON.parse(text); } catch { alert('Invalid JSON'); return; }
+
+  // In browser we can't load the image by path, so prompt user to load it
+  const {corners: c, edge_verts: ev, output_size, tiles} = proj;
+
+  // Try to load image if it's stored as data URL, otherwise prompt
+  const applyProject = () => {
+    corners = c.map(p=>[...p]);
+    edgeVerts = ev.map(p=>[...p]);
+    updatePersp();
+    document.getElementById('out-w').value = output_size[0];
+    document.getElementById('out-h').value = output_size[1];
+    document.getElementById('tiles').value = tiles ?? 3;
+    document.getElementById('wrap-h').checked = proj.wrap_h ?? false;
+    document.getElementById('wrap-v').checked = proj.wrap_v ?? false;
+    const mh = proj.wrap_mode_h ?? proj.wrap_mode ?? 'reflect';
+    const mv = proj.wrap_mode_v ?? proj.wrap_mode ?? 'reflect';
+    document.getElementById('mode-h').value = mh === 'reflect' ? 'Reflect' : 'Extend';
+    document.getElementById('mode-v').value = mv === 'reflect' ? 'Reflect' : 'Extend';
+    if ('fade_pct_h' in proj) document.getElementById('fade-h').value = proj.fade_pct_h;
+    else if ('fade_h' in proj) document.getElementById('fade-h').value = Math.round(proj.fade_h / output_size[0] * 100);
+    if ('fade_pct_v' in proj) document.getElementById('fade-v').value = proj.fade_pct_v;
+    else if ('fade_v' in proj) document.getElementById('fade-v').value = Math.round(proj.fade_v / output_size[1] * 100);
+    document.getElementById('noise-str').value = proj.noise_str ?? 0;
+    document.getElementById('noise-scale').value = proj.noise_scale ?? 32;
+    drawImageView();
+    scheduleRefresh();
+  };
+
+  if (srcImage) {
+    applyProject();
+  } else {
+    // Prompt for image
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/*';
+    inp.onchange = async e2 => {
+      const f2 = e2.target.files[0]; if (!f2) return;
+      await loadImageFile(f2);
+      applyProject();
+    };
+    inp.click();
+  }
+}
+
+// ─── FFT toggle ───────────────────────────────────────────────────────────────
+
+const btnFft = document.getElementById('btn-fft-toggle');
+btnFft.addEventListener('click', () => {
+  const open = btnFft.classList.toggle('active');
+  document.getElementById('fft-panel').style.display = open ? 'block' : 'none';
+  btnFft.textContent = open ? 'FFT notch ▼' : 'FFT notch ▶';
+});
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
+buildFFTGrid();
+resizeCanvases();
+</script>
+</body>
+</html>
