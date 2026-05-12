@@ -81,6 +81,12 @@ button.active { background: #336; border-color: #88f; }
 </div>
 
 <div id="fft-panel">
+  <div class="bar" style="padding:2px 0">
+    <label>Log bias (sRGB, 0=off):</label>
+    <input type="number" id="fft-log-bias" value="0" min="0" max="1" step="0.01" style="width:65px">
+    <label>Strength:</label>
+    <input type="number" id="fft-strength" value="1" min="0" max="1" step="0.05" style="width:60px">
+  </div>
   <div id="fft-grid"></div>
 </div>
 
@@ -635,12 +641,31 @@ void main(){
   else { oRG=vec4(0); oB=vec4(0); }
 }`;
 
-// Scale IFFT result by 1/N^2, bilinear-upsample artifact, subtract from source
+// Apply log transform to NxN ping data: log(x + b), result -> pong
+const FFT_LOG_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uSrcRG, uSrcB;
+uniform float uLogBias;
+layout(location=0) out vec4 oRG;
+layout(location=1) out vec4 oB;
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  vec4 rg = texelFetch(uSrcRG, p, 0);
+  vec4 b  = texelFetch(uSrcB,  p, 0);
+  oRG = vec4(log(rg.r + uLogBias), 0.0, log(rg.b + uLogBias), 0.0);
+  oB  = vec4(log(b.r  + uLogBias), 0.0, 0.0, 0.0);
+}`;
+
+// Scale IFFT result by 1/N^2, bilinear-upsample artifact, subtract from source.
+// In log mode: IFFT output is the filtered log-domain artifact; apply as
+//   exp(log(src+b) - artifact_upsampled) - b
 const FFT_SUBTRACT_FRAG = `#version 300 es
 precision highp float;
 uniform sampler2D uSrc, uArtRG, uArtB;
 uniform vec2 uSrcSize, uArtSize;
 uniform float uArtScale;
+uniform float uLogBias;  // 0 = linear mode
+uniform float uStrength;
 out vec4 fragColor;
 void main(){
   ivec2 p = ivec2(gl_FragCoord.xy);
@@ -659,9 +684,14 @@ void main(){
   float r=mix(mix(rg00.r,rg10.r,frac.x),mix(rg01.r,rg11.r,frac.x),frac.y);
   float g=mix(mix(rg00.b,rg10.b,frac.x),mix(rg01.b,rg11.b,frac.x),frac.y);
   float b=mix(mix(b00.r, b10.r, frac.x),mix(b01.r, b11.r, frac.x),frac.y);
-  vec3 src=texelFetch(uSrc,p,0).rgb;
-  // uArtScale = 1/(N*N) normalizes the unnormalized IFFT output
-  fragColor=vec4(clamp(src - vec3(r,g,b)*uArtScale, 0.0, 1.0), 1.0);
+  vec3 art = vec3(r,g,b) * uArtScale * uStrength;
+  vec3 src = texelFetch(uSrc,p,0).rgb;
+  if(uLogBias > 0.0){
+    // art is the filtered log-domain signal; subtract in log space then exponentiate
+    fragColor = vec4(clamp(exp(log(src + uLogBias) - art) - uLogBias, 0.0, 1.0), 1.0);
+  } else {
+    fragColor = vec4(clamp(src - art, 0.0, 1.0), 1.0);
+  }
 }`;
 
 // GPU FFT state
@@ -713,6 +743,7 @@ function ensureFFTProgs() {
     bitrevCol:    fftMakeProg(FFT_BITREV_FRAG(false)),
     butterflyRow: fftMakeProg(FFT_BUTTERFLY_FRAG(true)),
     butterflyCol: fftMakeProg(FFT_BUTTERFLY_FRAG(false)),
+    log:          fftMakeProg(FFT_LOG_FRAG),
     notch:        fftMakeProg(FFT_NOTCH_FRAG),
     subtract:     fftMakeProg(FFT_SUBTRACT_FRAG),
   };
@@ -806,14 +837,12 @@ function fftButterfly(isRow, N, inverse) {
   // Result is in ping after the final swap.
 }
 
-function applyFFTNotchGPU(srcFboTex, W, H, activeBins) {
+function applyFFTNotchGPU(srcFboTex, W, H, activeBins, logBias) {
   const N = FFT_SIZE;
   ensureFFTProgs();
   ensureFFTTextures(W, H);
 
   // --- Ingest source into float texture ---
-  // We can read from srcFboTex (the extraction FBO tex) directly in a shader.
-  // Use the dsampleH pass for that: it reads RGBA and outputs to hRG+hB.
   const pH = fftProgs.dsampleH;
   gl.useProgram(pH);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcFboTex);
@@ -832,6 +861,16 @@ function applyFFTNotchGPU(srcFboTex, W, H, activeBins) {
   gl.uniform1i(gl.getUniformLocation(pV, 'uDstW'), N);
   fftDraw(fftFBOs.ping, N, N);
 
+  // --- Log transform (if enabled): ping -> log(x+b) -> pong, swap into ping ---
+  if (logBias > 0) {
+    const pL = fftProgs.log;
+    gl.useProgram(pL);
+    gl.uniform1f(gl.getUniformLocation(pL, 'uLogBias'), logBias);
+    fftBind2(pL, 'uSrcRG', fftTexs.pingRG, 'uSrcB', fftTexs.pingB);
+    fftDraw(fftFBOs.pong, N, N);
+    fftSwapPingPong();  // log data now in ping, ready for FFT
+  }
+
   // --- Forward FFT rows then cols ---
   fftButterfly(true,  N, false);
   fftButterfly(false, N, false);
@@ -847,12 +886,7 @@ function applyFFTNotchGPU(srcFboTex, W, H, activeBins) {
   gl.uniform1i(gl.getUniformLocation(pN, 'uNBins'), bins.length);
   gl.uniform2iv(gl.getUniformLocation(pN, 'uBins'), binsFlat);
   fftDraw(fftFBOs.pong, N, N);
-  // Swap so result is in ping
-  [fftTexs.pingRG, fftTexs.pongRG] = [fftTexs.pongRG, fftTexs.pingRG];
-  [fftTexs.pingB,  fftTexs.pongB]  = [fftTexs.pongB,  fftTexs.pingB];
-  gl.deleteFramebuffer(fftFBOs.ping); gl.deleteFramebuffer(fftFBOs.pong);
-  fftFBOs.ping = fftMakeFBO2(fftTexs.pingRG, fftTexs.pingB);
-  fftFBOs.pong = fftMakeFBO2(fftTexs.pongRG, fftTexs.pongB);
+  fftSwapPingPong();
 
   // --- Inverse FFT cols then rows ---
   fftButterfly(false, N, true);
@@ -870,9 +904,11 @@ function applyFFTNotchGPU(srcFboTex, W, H, activeBins) {
   gl.uniform2f(gl.getUniformLocation(pS, 'uSrcSize'), W, H);
   gl.uniform2f(gl.getUniformLocation(pS, 'uArtSize'), N, N);
   gl.uniform1f(gl.getUniformLocation(pS, 'uArtScale'), 1.0 / (N * N));
+  gl.uniform1f(gl.getUniformLocation(pS, 'uLogBias'), logBias);
+  gl.uniform1f(gl.getUniformLocation(pS, 'uStrength'), +document.getElementById('fft-strength').value);
   fftDraw(fftFBOs.out, W, H);
 
-  return fftTexs.out;  // caller uses this texture directly for preview/export
+  return fftTexs.out;
 }
 
 // ─── FFT Grid UI ─────────────────────────────────────────────────────────────
@@ -1029,7 +1065,8 @@ function runExtract() {
   const bins = activeFftBins();
   let previewTex, previewFbo;
   if (bins.length > 0) {
-    previewTex = applyFFTNotchGPU(fboTex, outW, outH, bins);
+    const logBias = +document.getElementById('fft-log-bias').value;
+    previewTex = applyFFTNotchGPU(fboTex, outW, outH, bins, logBias);
     previewFbo = fftFBOs.out;
   } else {
     previewTex = fboTex;
@@ -1333,7 +1370,7 @@ document.addEventListener('drop', e => {
 
 // ─── Controls ───────────────────────────────────────────────────────────────
 
-for (const id of ['out-w','out-h','fade-h','fade-v','noise-str','noise-scale','wrap-h','wrap-v','mode-h','mode-v'])
+for (const id of ['out-w','out-h','fade-h','fade-v','noise-str','noise-scale','wrap-h','wrap-v','mode-h','mode-v','fft-log-bias','fft-strength'])
   document.getElementById(id).addEventListener('change', scheduleRefresh);
 
 document.getElementById('tiles').addEventListener('change', drawPreview);
