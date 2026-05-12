@@ -76,6 +76,8 @@ button.active { background: #336; border-color: #88f; }
   <input type="number" id="noise-str" value="0" min="0" max="256" style="width:55px">
   <label>scale:</label>
   <input type="number" id="noise-scale" value="32" min="1" max="512" style="width:55px">
+  <label>seed:</label>
+  <input type="number" id="noise-seed" value="0" min="0" step="1" style="width:65px">
 </div>
 
 <div class="bar">
@@ -332,7 +334,7 @@ uniform vec2 uB0,uB1,uB2,uB3,uB4;
 uniform vec2 uL0,uL1,uL2,uL3,uL4;
 uniform vec2 uR0,uR1,uR2,uR3,uR4;
 uniform float uWrapH,uWrapV,uFadePxH,uFadePxV;
-uniform float uNoiseStr,uNoiseScale;
+uniform float uNoiseStr,uNoiseScale,uNoiseSeed;
 uniform float uModeExtendH,uModeExtendV;
 uniform vec2 uOutSize;
 out vec4 fragColor;
@@ -366,17 +368,22 @@ vec4 sampleAt(float u,float v,vec2 duvdx,vec2 duvdy){
 }
 
 vec2 grad2(float ix,float iy){
-  vec2 p=fract(vec2(ix*0.1031,iy*0.1030));
-  p+=dot(p,p.yx+33.33);
-  float h=fract((p.x+p.y)*p.x);
-  float a=h*6.2831853;
-  return vec2(cos(a),sin(a));
+  uint x = uint(int(ix));
+  uint y = uint(int(iy));
+  // MurmurHash3 finalizer mix, combining x and y with golden-ratio increment
+  uint h = x;
+  h ^= y * 0x9e3779b9u;
+  h = (h ^ (h >> 16u)) * 0x85ebca6bu;
+  h = (h ^ (h >> 13u)) * 0xc2b2ae35u;
+  h ^= h >> 16u;
+  float a = float(h) * (6.2831853 / 4294967296.0);
+  return vec2(cos(a), sin(a));
 }
 
 float gradNoise(float x,float y,float scale){
   float fx=x/scale,fy=y/scale;
-  float ix0=floor(fx),iy0=floor(fy);
-  float tx=fx-ix0,ty=fy-iy0;
+  float ix0=floor(fx)+uNoiseSeed,iy0=floor(fy)+uNoiseSeed;
+  float tx=fx-floor(fx),ty=fy-floor(fy);
   float ux=tx*tx*(3.0-2.0*tx),uy=ty*ty*(3.0-2.0*ty);
   float n00=dot(grad2(ix0,iy0),vec2(tx,ty));
   float n10=dot(grad2(ix0+1.0,iy0),vec2(tx-1.0,ty));
@@ -521,7 +528,7 @@ function ensureShader() {
     'uL0','uL1','uL2','uL3','uL4',
     'uR0','uR1','uR2','uR3','uR4',
     'uWrapH','uWrapV','uFadePxH','uFadePxV',
-    'uNoiseStr','uNoiseScale','uModeExtendH','uModeExtendV','uOutSize',
+    'uNoiseStr','uNoiseScale','uNoiseSeed','uModeExtendH','uModeExtendV','uOutSize',
   ];
   for (const n of names)
     extractUniforms[n] = gl.getUniformLocation(extractProg, n);
@@ -1062,6 +1069,7 @@ function getSeamKwargs() {
     fade_px_v: Math.round(+document.getElementById('fade-v').value / 100.0 * H),
     noise_str: (+document.getElementById('noise-str').value / 5.0) ** 2.0,
     noise_scale: +document.getElementById('noise-scale').value,
+    noise_seed: +document.getElementById('noise-seed').value,
   };
 }
 
@@ -1116,6 +1124,7 @@ function runExtract() {
   gl.uniform1f(u.uFadePxV, fpxV);
   gl.uniform1f(u.uNoiseStr, kw.noise_str);
   gl.uniform1f(u.uNoiseScale, kw.noise_scale);
+  gl.uniform1f(u.uNoiseSeed, kw.noise_seed);
   gl.uniform1f(u.uModeExtendH, kw.mode_h === 'extend' ? 1 : 0);
   gl.uniform1f(u.uModeExtendV, kw.mode_v === 'extend' ? 1 : 0);
   gl.uniform2f(u.uOutSize, outW, outH);
@@ -1453,7 +1462,7 @@ document.addEventListener('drop', e => {
 
 // ─── Controls ───────────────────────────────────────────────────────────────
 
-for (const id of ['out-w','out-h','fade-h','fade-v','noise-str','noise-scale','wrap-h','wrap-v','mode-h','mode-v','fft-log-bias','fft-strength'])
+for (const id of ['out-w','out-h','fade-h','fade-v','noise-str','noise-scale','noise-seed','wrap-h','wrap-v','mode-h','mode-v','fft-log-bias','fft-strength'])
   document.getElementById(id).addEventListener('change', scheduleRefresh);
 
 document.getElementById('tiles').addEventListener('change', drawPreview);
