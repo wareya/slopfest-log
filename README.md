@@ -2,7 +2,7 @@
 
 This is where I dump random vibecoded garbage.
 
-Detextour, a perspective-correct texture-from-photo extractor with seamless tiling and high performance:
+Detextour, a perspective-correct texture-from-photo extractor with seamless tiling and high performance, can also be used to fix the tiling of existing textures:
 - https://oomfievroomfie.github.io/slopfest-log/html/detextour.html
 
 2D graphing calculator, outputting Z as pixel color:
