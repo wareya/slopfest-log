@@ -377,8 +377,10 @@ void main(){
   vec2 duvdy=dFdy(vec2(u,v));
 
   // 2x2 supersample: offset by ±0.25 pixel in output UV space, halved derivatives
-  vec2 ox=duvdx*0.25, oy=duvdy*0.25;
-  vec2 ssdx=duvdx*0.25, ssdy=duvdy*0.25;
+  //vec2 ox=duvdx*0.25, oy=duvdy*0.25;
+  //vec2 ssdx=duvdx*0.25, ssdy=duvdy*0.25;
+  vec2 ox=duvdx*0.0, oy=duvdy*0.0;
+  vec2 ssdx=duvdx, ssdy=duvdy;
 
   if(wh<0.0001&&wv<0.0001){
     fragColor=0.25*(sampleAt(u-ox.x-oy.x,v-ox.y-oy.y,ssdx,ssdy)
@@ -465,8 +467,8 @@ function ensureSrcTex(bitmap) {
   gl.bindTexture(gl.TEXTURE_2D, srcTex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
   gl.generateMipmap(gl.TEXTURE_2D);
 }
