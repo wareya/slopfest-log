@@ -8,7 +8,8 @@
 body { background: #2b2b2b; color: #ddd; font: 13px/1.4 sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 #views { display: flex; flex: 1; min-height: 0; gap: 4px; padding: 4px 4px 0; }
 canvas { display: block; background: #2e2e2e; }
-#image-view { flex: 3; cursor: crosshair; }
+#image-view { }
+#image-handles { background: transparent; cursor: crosshair; }
 #preview-view { flex: 2; cursor: default; }
 .bar { display: flex; align-items: center; gap: 6px; padding: 3px 4px; flex-wrap: wrap; }
 .bar label { white-space: nowrap; }
@@ -31,7 +32,8 @@ button.active { background: #336; border-color: #88f; }
 
 <div id="views">
   <div class="view-wrap" style="flex:3">
-    <canvas id="image-view"></canvas>
+    <canvas id="image-view" style="position:absolute;inset:0;pointer-events:none"></canvas>
+    <canvas id="image-handles" style="position:absolute;inset:0"></canvas>
     <div id="img-overlay" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none;font-size:15px;color:#aaa;text-align:center;">
       Drop an image here<br><br>Scroll to zoom · Middle-drag to pan<br>Drag corners to define quad
     </div>
@@ -166,22 +168,82 @@ let perspFwd = null, perspInv = null;
 
 // ─── Canvases & GL ───────────────────────────────────────────────────────────
 
-const imgCanvas = document.getElementById('image-view');
-const prevCanvas = document.getElementById('preview-view');
+const imgCanvas = document.getElementById('image-view');      // WebGL2 — source image display
+const imgHandles = document.getElementById('image-handles');  // 2D — handles/cage overlay
+const prevCanvas = document.getElementById('preview-view');   // WebGL2 — tiled preview
 
-// Single WebGL2 context on prevCanvas. Extraction uses FBOs within this context.
-// prevCanvas default framebuffer is used for the preview display.
+// imgGl: draws the source image with mipmapping, pan/zoom.
+const imgGl = imgCanvas.getContext('webgl2', {preserveDrawingBuffer: true});
+if (!imgGl) alert('WebGL2 required');
+
+// gl / prevGl: extraction FBOs, FFT, and tiled preview all share this context.
 const gl = prevCanvas.getContext('webgl2', {preserveDrawingBuffer: true});
 if (!gl) alert('WebGL2 required');
-const prevGl = gl;  // alias — same context
+const prevGl = gl;
 const hasFloatLinear = !!gl.getExtension('OES_texture_float_linear');
 
-const img2d = imgCanvas.getContext('2d');
+const img2d = imgHandles.getContext('2d');
 
 // ─── Zoom/pan state ──────────────────────────────────────────────────────────
 
 const imgView = { zoom:1, panX:0, panY:0, panAnchor:null, zoomAnchor:null };
 const prevView = { zoom:1, panX:0, panY:0, panAnchor:null, zoomAnchor:null };
+
+// ─── Image view WebGL setup (imgGl) ──────────────────────────────────────────
+
+const IMGV_VERT = `#version 300 es
+out vec2 vUV;
+const vec2 POS[4] = vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
+void main(){
+  vec2 p = POS[gl_VertexID];
+  vUV = vec2(p.x, -p.y) * 0.5 + 0.5;
+  gl_Position = vec4(p, 0, 1);
+}`;
+const IMGV_FRAG = `#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uOffset;  // center offset in UV space
+uniform float uScale;  // pixels per texel
+uniform vec2 uInvViewSize;
+out vec4 fragColor;
+void main(){
+  vec2 uv = (vUV - 0.5) * uInvViewSize / uScale + uOffset;
+  if(any(lessThan(uv,vec2(0)))||any(greaterThanEqual(uv,vec2(1)))){
+    fragColor = vec4(0.18, 0.18, 0.18, 1); return;
+  }
+  fragColor = vec4(texture(uTex, uv).rgb, 1);
+}`;
+
+let imgvProg = null, imgvVAO = null, imgvTex = null, imgvBitmap = null;
+function ensureImgViewShader() {
+  if (imgvProg) return;
+  function comp(type, src) {
+    const s = imgGl.createShader(type);
+    imgGl.shaderSource(s, src); imgGl.compileShader(s);
+    if (!imgGl.getShaderParameter(s, imgGl.COMPILE_STATUS)) throw new Error(imgGl.getShaderInfoLog(s));
+    return s;
+  }
+  const p = imgGl.createProgram();
+  imgGl.attachShader(p, comp(imgGl.VERTEX_SHADER, IMGV_VERT));
+  imgGl.attachShader(p, comp(imgGl.FRAGMENT_SHADER, IMGV_FRAG));
+  imgGl.linkProgram(p);
+  imgvProg = p;
+  imgvVAO = imgGl.createVertexArray();
+}
+function ensureImgViewTex(bitmap) {
+  if (imgvBitmap === bitmap) return;
+  if (imgvTex) imgGl.deleteTexture(imgvTex);
+  imgvTex = imgGl.createTexture();
+  imgvBitmap = bitmap;
+  imgGl.bindTexture(imgGl.TEXTURE_2D, imgvTex);
+  imgGl.texImage2D(imgGl.TEXTURE_2D, 0, imgGl.RGBA, imgGl.RGBA, imgGl.UNSIGNED_BYTE, bitmap);
+  imgGl.generateMipmap(imgGl.TEXTURE_2D);
+  imgGl.texParameteri(imgGl.TEXTURE_2D, imgGl.TEXTURE_MIN_FILTER, imgGl.LINEAR_MIPMAP_LINEAR);
+  imgGl.texParameteri(imgGl.TEXTURE_2D, imgGl.TEXTURE_MAG_FILTER, imgGl.LINEAR);
+  imgGl.texParameteri(imgGl.TEXTURE_2D, imgGl.TEXTURE_WRAP_S, imgGl.CLAMP_TO_EDGE);
+  imgGl.texParameteri(imgGl.TEXTURE_2D, imgGl.TEXTURE_WRAP_T, imgGl.CLAMP_TO_EDGE);
+}
 
 // ─── Preview WebGL setup ─────────────────────────────────────────────────────
 
@@ -234,10 +296,11 @@ function updatePreviewTexture(tex, w, h, isFloat) {
   prevTexId = tex;
   prevTexW = w; prevTexH = h;
   gl.bindTexture(gl.TEXTURE_2D, tex);
-  // Float textures require OES_texture_float_linear for LINEAR; fall back to NEAREST.
-  const filter = (isFloat && !hasFloatLinear) ? gl.NEAREST : gl.LINEAR;
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  // Float textures require OES_texture_float_linear for LINEAR filtering.
+  const linear = !isFloat || hasFloatLinear;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, linear ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST_MIPMAP_NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, linear ? gl.LINEAR : gl.NEAREST);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
 }
@@ -1129,18 +1192,35 @@ function updatePersp() {
 }
 
 function drawImageView() {
-  const c = imgCanvas, ctx = img2d;
-  const vw = c.width, vh = c.height;
-  ctx.fillStyle = '#2e2e2e';
-  ctx.fillRect(0, 0, vw, vh);
+  const vw = imgCanvas.width, vh = imgCanvas.height;
 
-  if (!srcImage) return;
+  // Draw source image via WebGL with mipmapping
+  imgGl.bindFramebuffer(imgGl.FRAMEBUFFER, null);
+  imgGl.viewport(0, 0, vw, vh);
+  imgGl.clearColor(0.18, 0.18, 0.18, 1);
+  imgGl.clear(imgGl.COLOR_BUFFER_BIT);
+  if (srcImage) {
+    ensureImgViewShader();
+    ensureImgViewTex(srcImage);
+    const {cx, cy, scale} = imgTransform();
+    // offset = UV of pixel at canvas center
+    const offU = (srcW/2 - (cx - vw/2) / scale) / srcW;
+    const offV = (srcH/2 - (cy - vh/2) / scale) / srcH;
+    imgGl.useProgram(imgvProg);
+    imgGl.activeTexture(imgGl.TEXTURE0);
+    imgGl.bindTexture(imgGl.TEXTURE_2D, imgvTex);
+    imgGl.uniform1i(imgGl.getUniformLocation(imgvProg, 'uTex'), 0);
+    imgGl.uniform2f(imgGl.getUniformLocation(imgvProg, 'uOffset'), offU, offV);
+    imgGl.uniform1f(imgGl.getUniformLocation(imgvProg, 'uScale'), scale);
+    imgGl.uniform2f(imgGl.getUniformLocation(imgvProg, 'uInvViewSize'), vw/srcW, vh/srcH);
+    imgGl.bindVertexArray(imgvVAO);
+    imgGl.drawArrays(imgGl.TRIANGLE_STRIP, 0, 4);
+    imgGl.bindVertexArray(null);
+  }
 
-  const {cx, cy, scale} = imgTransform();
-  const dw = srcW * scale, dh = srcH * scale;
-  const dx = cx - dw/2, dy = cy - dh/2;
-
-  ctx.drawImage(srcImage, dx, dy, dw, dh);
+  // Draw handles overlay on 2D canvas
+  const ctx = img2d;
+  ctx.clearRect(0, 0, vw, vh);
 
   if (corners.length !== 4 || !perspFwd) return;
 
@@ -1214,9 +1294,12 @@ function drawPreview() {
 // ─── Canvas resize ────────────────────────────────────────────────────────────
 
 function resizeCanvases() {
-  const iw = imgCanvas.parentElement, pw = prevCanvas.parentElement;
-  imgCanvas.width  = iw.clientWidth;  imgCanvas.height  = iw.clientHeight;
-  prevCanvas.width = pw.clientWidth;  prevCanvas.height = pw.clientHeight;
+  const iw = imgHandles.parentElement, pw = prevCanvas.parentElement;
+  const iW = iw.clientWidth, iH = iw.clientHeight;
+  const pW = pw.clientWidth, pH = pw.clientHeight;
+  imgCanvas.width  = iW; imgCanvas.height  = iH;
+  imgHandles.width = iW; imgHandles.height = iH;
+  prevCanvas.width = pW; prevCanvas.height = pH;
   drawImageView();
   drawPreview();
 }
@@ -1246,7 +1329,7 @@ function hitTest(sx, sy) {
   return best;
 }
 
-imgCanvas.addEventListener('mousedown', e => {
+imgHandles.addEventListener('mousedown', e => {
   if (e.button === 1 || (e.button===0 && e.altKey && !e.ctrlKey)) {
     imgView.panAnchor = [e.offsetX, e.offsetY, imgView.panX, imgView.panY];
     return;
@@ -1259,7 +1342,7 @@ imgCanvas.addEventListener('mousedown', e => {
   dragIdx = hitTest(e.offsetX, e.offsetY);
 });
 
-imgCanvas.addEventListener('mousemove', e => {
+imgHandles.addEventListener('mousemove', e => {
   if (imgView.panAnchor && (e.buttons & (1|4))) {
     const [ax,ay,apx,apy] = imgView.panAnchor;
     imgView.panX = apx + e.offsetX - ax;
@@ -1288,11 +1371,11 @@ imgCanvas.addEventListener('mousemove', e => {
   scheduleRefresh();
 });
 
-imgCanvas.addEventListener('mouseup', e => {
+imgHandles.addEventListener('mouseup', e => {
   imgView.panAnchor = null; imgView.zoomAnchor = null; dragIdx = -1;
 });
 
-imgCanvas.addEventListener('wheel', e => {
+imgHandles.addEventListener('wheel', e => {
   e.preventDefault();
   if (!srcImage) return;
   const factor = e.deltaY < 0 ? 1.15 : 1/1.15;
