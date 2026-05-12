@@ -17,7 +17,7 @@
 </head>
 <body>
 
-    <h2>DDS Viewer (DXT1 / DXT3 / DXT5 / BC7)</h2>
+    <h2>DDS Viewer (DXT1 / DXT3 / DXT5 / BC7 / Uncompressed)</h2>
     <div id="drop-zone">Drop .dds file here</div>
     <div class="info" id="file-info">Ready.</div>
     <div id="mip-controls"></div>
@@ -99,17 +99,23 @@
 
     // State for the currently loaded file
     let currentPixelData = null, currentFormat = "", currentMipOffsets = [], currentMipSizes = [];
+    let currentUncompressedInfo = null;
 
     function blockBytes(format) { return format === "DXT1" ? 8 : 16; }
 
-    function mipLevelByteSize(w, h, format) {
+    function mipLevelByteSize(w, h, format, uncompressedInfo) {
+        if (format === "UNCOMPRESSED") {
+            return Math.ceil(w * uncompressedInfo.bpp / 8) * h;
+        }
         return Math.max(1, Math.ceil(w / 4)) * Math.max(1, Math.ceil(h / 4)) * blockBytes(format);
     }
 
     function showMip(level) {
         const w = currentMipSizes[level][0], h = currentMipSizes[level][1];
         const offset = currentMipOffsets[level];
-        const rgba = decompress(currentPixelData, w, h, currentFormat, offset);
+        const rgba = currentFormat === "UNCOMPRESSED"
+            ? decodeUncompressed(currentPixelData, w, h, currentUncompressedInfo, offset)
+            : decompress(currentPixelData, w, h, currentFormat, offset);
         canvas.width = w; canvas.height = h;
         ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
         mipControls.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', i === level));
@@ -128,6 +134,19 @@
 
         let format = "";
         let dataOffset = 128;
+        let uncompressedInfo = null; // { rMask, gMask, bMask, aMask, bpp }
+
+        const pixelFormatFlags = header[20];
+        const rgbBitCount = header[22];
+        const rMask = header[23] >>> 0;
+        const gMask = header[24] >>> 0;
+        const bMask = header[25] >>> 0;
+        const aMask = header[26] >>> 0;
+
+        const DDPF_RGB       = 0x40;
+        const DDPF_LUMINANCE = 0x20000;
+        const DDPF_ALPHA     = 0x2;
+        const DDPF_ALPHAPIXELS = 0x1;
 
         if (fourCC === 0x31545844) format = "DXT1";
         else if (fourCC === 0x33545844) format = "DXT3";
@@ -137,11 +156,22 @@
             if (dxgiFormat >= 97 && dxgiFormat <= 99) { format = "BC7"; dataOffset = 148; }
             else return alert(`Unsupported DX10 format. (DXGI_FORMAT: ${dxgiFormat})`);
         }
-        else return alert("Unsupported format. Only DXT1, 3, 5, and BC7 are supported.");
+        else if (pixelFormatFlags & (DDPF_RGB | DDPF_LUMINANCE | DDPF_ALPHA)) {
+            format = "UNCOMPRESSED";
+            uncompressedInfo = { rMask, gMask, bMask, aMask, bpp: rgbBitCount,
+                isLuminance: !!(pixelFormatFlags & DDPF_LUMINANCE),
+                isAlphaOnly: !!(pixelFormatFlags & DDPF_ALPHA) && !(pixelFormatFlags & (DDPF_RGB | DDPF_LUMINANCE)),
+                hasAlpha: !!(pixelFormatFlags & DDPF_ALPHAPIXELS) };
+        }
+        else return alert("Unsupported format. Only DXT1, 3, 5, BC7, and uncompressed formats are supported.");
 
-        info.innerText = `File: ${file.name} | Resolution: ${width}×${height} | Format: ${format} | Mipmaps: ${mipCount}`;
+        const formatLabel = format === "UNCOMPRESSED"
+            ? `Uncompressed ${rgbBitCount}bpp`
+            : format;
+        info.innerText = `File: ${file.name} | Resolution: ${width}×${height} | Format: ${formatLabel} | Mipmaps: ${mipCount}`;
 
         currentFormat = format;
+        currentUncompressedInfo = uncompressedInfo;
         currentPixelData = new Uint8Array(buffer, dataOffset);
         currentMipOffsets = [];
         currentMipSizes = [];
@@ -152,7 +182,7 @@
             const mh = Math.max(1, height >> i);
             currentMipOffsets.push(off);
             currentMipSizes.push([mw, mh]);
-            off += mipLevelByteSize(mw, mh, format);
+            off += mipLevelByteSize(mw, mh, format, uncompressedInfo);
         }
 
         // Build mip selector buttons
@@ -172,6 +202,52 @@
         }
 
         showMip(0);
+    }
+
+    function extractChannel(pixel, mask) {
+        if (mask === 0) return 0;
+        const shift = Math.clz32(mask & -mask) ^ 31; // position of lowest set bit
+        const raw = (pixel >>> shift) & (mask >>> shift);
+        const bits = 32 - Math.clz32(mask >>> shift);
+        // Scale from `bits`-bit value to 8-bit
+        if (bits >= 8) return raw >>> (bits - 8);
+        return (raw * 255 / ((1 << bits) - 1) + 0.5) | 0;
+    }
+
+    function decodeUncompressed(src, width, height, info, srcOffset = 0) {
+        const dst = new Uint8Array(width * height * 4);
+        const bytesPerPixel = Math.ceil(info.bpp / 8);
+        const stride = Math.ceil(width * info.bpp / 8);
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const byteOff = srcOffset + y * stride + x * bytesPerPixel;
+                let pixel = 0;
+                for (let b = 0; b < bytesPerPixel && byteOff + b < src.length; b++) {
+                    pixel |= src[byteOff + b] << (b * 8);
+                }
+                pixel >>>= 0;
+                let r, g, b2, a;
+                if (info.isAlphaOnly) {
+                    r = g = b2 = 0;
+                    a = extractChannel(pixel, info.aMask || 0xFF);
+                } else if (info.isLuminance) {
+                    const lum = extractChannel(pixel, info.rMask || 0xFF);
+                    r = g = b2 = lum;
+                    a = info.hasAlpha ? extractChannel(pixel, info.aMask) : 255;
+                } else {
+                    r  = extractChannel(pixel, info.rMask);
+                    g  = extractChannel(pixel, info.gMask);
+                    b2 = extractChannel(pixel, info.bMask);
+                    a  = info.hasAlpha ? extractChannel(pixel, info.aMask) : 255;
+                }
+                const outIdx = (y * width + x) * 4;
+                dst[outIdx]     = r;
+                dst[outIdx + 1] = g;
+                dst[outIdx + 2] = b2;
+                dst[outIdx + 3] = a;
+            }
+        }
+        return dst;
     }
 
     function decompress(src, width, height, format, srcOffset = 0) {
