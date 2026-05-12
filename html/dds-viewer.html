@@ -10,6 +10,9 @@
         canvas { background-image: conic-gradient(#bbb 90deg, transparent 90deg 180deg, #bbb 180deg 270deg, transparent 270deg); background-size: 20px 20px; background-position: 0 0, 0 10px, 10px -10px, -10px 0px; border: 1px solid #000; max-width: 90vw; vertical-align: bottom; }
         #dummy { background-color: #444; }
         .info { margin-bottom: 10px; color: #aaa; }
+        #mip-controls { display: none; margin-bottom: 12px; }
+        #mip-controls button { background: #333; color: #ccc; border: 1px solid #555; border-radius: 4px; padding: 4px 10px; margin: 2px; cursor: pointer; font-size: 13px; }
+        #mip-controls button.active { background: #555; color: #fff; border-color: #888; }
     </style>
 </head>
 <body>
@@ -17,6 +20,7 @@
     <h2>DDS Viewer (DXT1 / DXT3 / DXT5 / BC7)</h2>
     <div id="drop-zone">Drop .dds file here</div>
     <div class="info" id="file-info">Ready.</div>
+    <div id="mip-controls"></div>
     <div id="dummy"><canvas id="preview"></canvas></div>
 
 <script>
@@ -82,6 +86,7 @@
     const info = document.getElementById('file-info');
     const canvas = document.getElementById('preview');
     const ctx = canvas.getContext('2d');
+    const mipControls = document.getElementById('mip-controls');
 
     dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('hover'); });
     dropZone.addEventListener('dragleave', () => dropZone.classList.remove('hover'));
@@ -92,47 +97,86 @@
         if (file) processDDS(file);
     });
 
+    // State for the currently loaded file
+    let currentPixelData = null, currentFormat = "", currentMipOffsets = [], currentMipSizes = [];
+
+    function blockBytes(format) { return format === "DXT1" ? 8 : 16; }
+
+    function mipLevelByteSize(w, h, format) {
+        return Math.max(1, Math.ceil(w / 4)) * Math.max(1, Math.ceil(h / 4)) * blockBytes(format);
+    }
+
+    function showMip(level) {
+        const w = currentMipSizes[level][0], h = currentMipSizes[level][1];
+        const offset = currentMipOffsets[level];
+        const rgba = decompress(currentPixelData, w, h, currentFormat, offset);
+        canvas.width = w; canvas.height = h;
+        ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+        mipControls.querySelectorAll('button').forEach((b, i) => b.classList.toggle('active', i === level));
+    }
+
     async function processDDS(file) {
         const buffer = await file.arrayBuffer();
         const header = new Int32Array(buffer, 0, 32);
-        
+
         if (header[0] !== 0x20534444) return alert("Not a DDS file");
 
         const height = header[3];
-        const width = header[4];
+        const width  = header[4];
+        const mipCount = Math.max(1, header[7]);
         const fourCC = header[21];
-        
+
         let format = "";
-        let dataOffset = 128; // Standard DDS header size
-        
+        let dataOffset = 128;
+
         if (fourCC === 0x31545844) format = "DXT1";
         else if (fourCC === 0x33545844) format = "DXT3";
         else if (fourCC === 0x35545844) format = "DXT5";
-        else if (fourCC === 0x30315844) { // DX10
+        else if (fourCC === 0x30315844) {
             const dxgiFormat = new Int32Array(buffer, 128, 1)[0];
-            // Format 97=TYPELESS, 98=UNORM, 99=UNORM_SRGB
-            if (dxgiFormat >= 97 && dxgiFormat <= 99) {
-                format = "BC7";
-                dataOffset = 148; // Shift past the 20-byte DDS_HEADER_DXT10
-            } else {
-                return alert(`Unsupported DX10 format. (DXGI_FORMAT: ${dxgiFormat})`);
-            }
+            if (dxgiFormat >= 97 && dxgiFormat <= 99) { format = "BC7"; dataOffset = 148; }
+            else return alert(`Unsupported DX10 format. (DXGI_FORMAT: ${dxgiFormat})`);
         }
         else return alert("Unsupported format. Only DXT1, 3, 5, and BC7 are supported.");
 
-        info.innerText = `File: ${file.name} | Resolution: ${width}x${height} | Format: ${format}`;
-        
-        const pixelData = new Uint8Array(buffer, dataOffset);
-        
-        const rgba = decompress(pixelData, width, height, format);
-        canvas.width = width;
-        canvas.height = height;
-        ctx.putImageData(new ImageData(new Uint8ClampedArray(rgba), width, height), 0, 0);
+        info.innerText = `File: ${file.name} | Resolution: ${width}×${height} | Format: ${format} | Mipmaps: ${mipCount}`;
+
+        currentFormat = format;
+        currentPixelData = new Uint8Array(buffer, dataOffset);
+        currentMipOffsets = [];
+        currentMipSizes = [];
+
+        let off = 0;
+        for (let i = 0; i < mipCount; i++) {
+            const mw = Math.max(1, width  >> i);
+            const mh = Math.max(1, height >> i);
+            currentMipOffsets.push(off);
+            currentMipSizes.push([mw, mh]);
+            off += mipLevelByteSize(mw, mh, format);
+        }
+
+        // Build mip selector buttons
+        mipControls.innerHTML = '';
+        if (mipCount > 1) {
+            mipControls.style.display = 'block';
+            for (let i = 0; i < mipCount; i++) {
+                const [mw, mh] = currentMipSizes[i];
+                const btn = document.createElement('button');
+                btn.textContent = `Mip ${i}  (${mw}×${mh})`;
+                const level = i;
+                btn.addEventListener('click', () => showMip(level));
+                mipControls.appendChild(btn);
+            }
+        } else {
+            mipControls.style.display = 'none';
+        }
+
+        showMip(0);
     }
 
-    function decompress(src, width, height, format) {
+    function decompress(src, width, height, format, srcOffset = 0) {
         const dst = new Uint8Array(width * height * 4);
-        let offset = 0;
+        let offset = srcOffset;
 
         for (let y = 0; y < height; y += 4) {
             for (let x = 0; x < width; x += 4) {
